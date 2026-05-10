@@ -6,9 +6,11 @@
     deepclaude                      # DeepSeek V4 Pro (default)
     deepclaude --backend or         # OpenRouter (cheapest)
     deepclaude --backend fw         # Fireworks AI (fastest)
+    deepclaude --backend nv         # Nvidia NIM (kimi-k2.6)
+    deepclaude --backend kimi       # Kimi Code (subscription)
+    deepclaude --backend dw         # Doubleword AI
     deepclaude --backend anthropic  # Normal Claude Code
-    deepclaude --remote             # Remote control + DeepSeek (browser URL)
-    deepclaude --remote -b or       # Remote control + OpenRouter
+    deepclaude --remote             # Remote control + default backend
     deepclaude --status             # Show keys and backends
     deepclaude --cost               # Pricing comparison
     deepclaude --benchmark          # Latency test
@@ -26,9 +28,32 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# ── Load .env if present ──
+$envFile = Join-Path $ScriptDir "proxy\.env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -match '^\s*#' -or [string]::IsNullOrWhiteSpace($line)) { return }
+        # Strip inline comments
+        $line = $line -replace '\s+#.*$', ''
+        if ($line -match '^([A-Z_]+)=(.*)$') {
+            $key = $Matches[1]
+            $val = $Matches[2]
+            # Only set if not already in environment
+            if (-not [Environment]::GetEnvironmentVariable($key, "Process")) {
+                [Environment]::SetEnvironmentVariable($key, $val, "Process")
+            }
+        }
+    }
+}
 
 if (-not $Backend -and -not $Status -and -not $Cost -and -not $Benchmark -and -not $Help) {
-    $Backend = if ($env:CHEAPCLAUDE_DEFAULT_BACKEND) { $env:CHEAPCLAUDE_DEFAULT_BACKEND } else { "ds" }
+    $envProvider = $env:API_PROVIDER
+    $Backend = if ($env:CHEAPCLAUDE_DEFAULT_BACKEND) { $env:CHEAPCLAUDE_DEFAULT_BACKEND }
+               elseif ($envProvider) { $envProvider }
+               else { "ds" }
 }
 
 # --- Config ---
@@ -41,30 +66,65 @@ $OpenRouterKey = if ($env:OPENROUTER_API_KEY) { $env:OPENROUTER_API_KEY } else {
 $FireworksKey = if ($env:FIREWORKS_API_KEY) { $env:FIREWORKS_API_KEY } else {
     [Environment]::GetEnvironmentVariable("FIREWORKS_API_KEY", "User")
 }
+$NvidiaKey = if ($env:NVIDIA_API_KEY) { $env:NVIDIA_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("NVIDIA_API_KEY", "User")
+}
+$KimiKey = if ($env:KIMI_API_KEY) { $env:KIMI_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("KIMI_API_KEY", "User")
+}
+$DoublewordKey = if ($env:DOUBLEWORD_API_KEY) { $env:DOUBLEWORD_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("DOUBLEWORD_API_KEY", "User")
+}
+
+$NvidiaModel = if ($env:NVIDIA_MODEL) { $env:NVIDIA_MODEL } else { "moonshotai/kimi-k2.6" }
+$KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
+$DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
+$DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
 
 $Providers = @{
     ds = @{
-        name = "DeepSeek (direct)"
+        name = "DeepSeek (direct)"; needsProxy = $false
         url = "https://api.deepseek.com/anthropic"
         key = $DeepSeekKey; keyName = "DEEPSEEK_API_KEY"
-        opus = "deepseek-v4-pro"; sonnet = "deepseek-v4-pro"
+        opus = $DeepSeekModel; sonnet = $DeepSeekModel
         haiku = "deepseek-v4-flash"; subagent = "deepseek-v4-flash"
     }
     or = @{
-        name = "OpenRouter"
+        name = "OpenRouter"; needsProxy = $false
         url = "https://openrouter.ai/api"
         key = $OpenRouterKey; keyName = "OPENROUTER_API_KEY"
         opus = "deepseek/deepseek-v4-pro"; sonnet = "deepseek/deepseek-v4-pro"
         haiku = "deepseek/deepseek-v4-pro"; subagent = "deepseek/deepseek-v4-pro"
     }
     fw = @{
-        name = "Fireworks AI"
+        name = "Fireworks AI"; needsProxy = $false
         url = "https://api.fireworks.ai/inference"
         key = $FireworksKey; keyName = "FIREWORKS_API_KEY"
         opus = "accounts/fireworks/models/deepseek-v4-pro"
         sonnet = "accounts/fireworks/models/deepseek-v4-pro"
         haiku = "accounts/fireworks/models/deepseek-v4-pro"
         subagent = "accounts/fireworks/models/deepseek-v4-pro"
+    }
+    nv = @{
+        name = "Nvidia NIM"; needsProxy = $true; canonical = "nvidia"
+        url = "https://integrate.api.nvidia.com/v1"
+        key = $NvidiaKey; keyName = "NVIDIA_API_KEY"
+        opus = $NvidiaModel; sonnet = $NvidiaModel
+        haiku = $NvidiaModel; subagent = $NvidiaModel
+    }
+    kimi = @{
+        name = "Kimi Code"; needsProxy = $false
+        url = "https://api.kimi.com/coding/"
+        key = $KimiKey; keyName = "KIMI_API_KEY"
+        opus = $KimiModel; sonnet = $KimiModel
+        haiku = $KimiModel; subagent = $KimiModel
+    }
+    dw = @{
+        name = "Doubleword AI"; needsProxy = $true; canonical = "doubleword"
+        url = "https://api.doubleword.ai/v1"
+        key = $DoublewordKey; keyName = "DOUBLEWORD_API_KEY"
+        opus = $DoublewordModel; sonnet = $DoublewordModel
+        haiku = $DoublewordModel; subagent = $DoublewordModel
     }
 }
 
@@ -81,10 +141,16 @@ if ($Status) {
     Write-Host "    DEEPSEEK_API_KEY:    $(Get-KeyDisplay $DeepSeekKey)"
     Write-Host "    OPENROUTER_API_KEY:  $(Get-KeyDisplay $OpenRouterKey)"
     Write-Host "    FIREWORKS_API_KEY:   $(Get-KeyDisplay $FireworksKey)"
+    Write-Host "    NVIDIA_API_KEY:      $(Get-KeyDisplay $NvidiaKey)"
+    Write-Host "    KIMI_API_KEY:        $(Get-KeyDisplay $KimiKey)"
+    Write-Host "    DOUBLEWORD_API_KEY:  $(Get-KeyDisplay $DoublewordKey)"
     Write-Host "`n  Backends:" -ForegroundColor Yellow
     Write-Host "    deepclaude              # DeepSeek V4 Pro (default)"
     Write-Host "    deepclaude -b or        # OpenRouter (cheapest)"
     Write-Host "    deepclaude -b fw        # Fireworks AI (fastest)"
+    Write-Host "    deepclaude -b nv        # Nvidia NIM (kimi-k2.6)"
+    Write-Host "    deepclaude -b kimi      # Kimi Code (subscription)"
+    Write-Host "    deepclaude -b dw        # Doubleword AI"
     Write-Host "    deepclaude -b anthropic # Normal Claude Code"
     Write-Host ""
     exit 0
@@ -92,17 +158,18 @@ if ($Status) {
 
 # --- Cost ---
 if ($Cost) {
-    Write-Host "`n  DeepSeek V4 Pro Pricing" -ForegroundColor Cyan
-    Write-Host "  =======================" -ForegroundColor DarkGray
+    Write-Host "`n  DeepClaude Provider Pricing" -ForegroundColor Cyan
+    Write-Host "  ===========================" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Provider        Input/M    Output/M   Cache Hit/M" -ForegroundColor Yellow
+    Write-Host "  Provider        Input/M    Output/M   Notes" -ForegroundColor Yellow
     Write-Host "  ----------      --------   --------   -----------"
-    Write-Host "  DeepSeek        `$0.44      `$0.87      `$0.004" -ForegroundColor Green
-    Write-Host "  OpenRouter      `$0.44      `$0.87      (provider)"
-    Write-Host "  Fireworks       `$1.74      `$3.48      (provider)"
-    Write-Host "  Anthropic       `$3.00      `$15.00     `$0.30"
-    Write-Host ""
-    Write-Host "  Monthly estimate (heavy use): `$30-80 vs `$200 Anthropic" -ForegroundColor Green
+    Write-Host "  DeepSeek        `$0.44      `$0.87      Native Anthropic" -ForegroundColor Green
+    Write-Host "  OpenRouter      `$0.44      `$0.87      Multi-provider"
+    Write-Host "  Fireworks       `$1.74      `$3.48      Low latency"
+    Write-Host "  Nvidia NIM      `$0.44      `$0.87      OpenAI-compat"
+    Write-Host "  Kimi Code       subscription         Anthropic-native"
+    Write-Host "  Doubleword      `$0.44      `$0.87      OpenAI-compat"
+    Write-Host "  Anthropic       `$3.00      `$15.00     Official"
     Write-Host ""
     exit 0
 }
@@ -113,7 +180,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: deepclaude [-b backend] [--status] [--cost] [--benchmark]"
     Write-Host ""
-    Write-Host "  -b, --backend   ds (default), or, fw, anthropic"
+    Write-Host "  -b, --backend   ds (default), or, fw, nv, kimi, dw, anthropic"
     Write-Host "  --status        Show keys and backends"
     Write-Host "  --cost          Pricing comparison"
     Write-Host "  --benchmark     Latency test"
@@ -150,9 +217,40 @@ if ($Benchmark) {
     exit 0
 }
 
+# ── Helper: Start proxy for OpenAI-compat backends ──
+function Start-TranslationProxy {
+    param($Provider)
+    $proxyScript = Join-Path $ScriptDir "proxy\start-proxy.js"
+    $canonical = if ($Provider.canonical) { $Provider.canonical } else { $Backend }
+    $tempFile = [System.IO.Path]::GetTempFileName()
+
+    $proxyProc = Start-Process -FilePath "node" `
+        -ArgumentList @($proxyScript, $Provider.url, $Provider.key) `
+        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tempFile
+
+    $tries = 0
+    while ($tries -lt 30) {
+        Start-Sleep -Milliseconds 200
+        $tries++
+        if (Test-Path $tempFile) {
+            $content = Get-Content $tempFile -ErrorAction SilentlyContinue
+            if ($content) { break }
+        }
+    }
+
+    $proxyPort = (Get-Content $tempFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    Remove-Item $tempFile -ErrorAction SilentlyContinue
+
+    if (-not $proxyPort) {
+        if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force }
+        throw "Proxy failed to start"
+    }
+
+    return @{ Port = ($proxyPort -replace '[^0-9]',''); Proc = $proxyProc }
+}
+
 # --- Remote ---
 if ($Remote) {
-    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     if ($Backend -eq "anthropic") {
         Write-Host "`n  Launching remote control (Anthropic)...`n" -ForegroundColor Cyan
         foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -229,7 +327,7 @@ if ($Backend -eq "anthropic") {
 }
 
 $p = $Providers[$Backend]
-if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, anthropic" -ForegroundColor Red; exit 1 }
+if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, anthropic" -ForegroundColor Red; exit 1 }
 if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
 Write-Host "`n  Launching Claude Code via $($p.name)..." -ForegroundColor Cyan
@@ -237,8 +335,22 @@ Write-Host "  Endpoint: $($p.url)" -ForegroundColor DarkGray
 Write-Host "  Model: $($p.opus) (main) + $($p.haiku) (subagents)" -ForegroundColor DarkGray
 Write-Host ""
 
-$env:ANTHROPIC_BASE_URL = $p.url
-$env:ANTHROPIC_AUTH_TOKEN = $p.key
+# OpenAI-compat backends need the translation proxy
+if ($p.needsProxy) {
+    Write-Host "  Starting translation proxy..." -ForegroundColor DarkGray
+    try {
+        $proxy = Start-TranslationProxy -Provider $p
+        $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$($proxy.Port)"
+        $env:ANTHROPIC_AUTH_TOKEN = "proxy-managed"
+    } catch {
+        Write-Host "ERROR: $_" -ForegroundColor Red
+        exit 1
+    }
+} else {
+    $env:ANTHROPIC_BASE_URL = $p.url
+    $env:ANTHROPIC_AUTH_TOKEN = $p.key
+}
+
 $env:ANTHROPIC_MODEL = $p.opus
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL = $p.opus
 $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $p.sonnet
@@ -247,10 +359,16 @@ $env:CLAUDE_CODE_SUBAGENT_MODEL = $p.subagent
 $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
-& claude @Args
-
-foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
-    Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+try {
+    & claude @Args
+} finally {
+    if ($proxy -and $proxy.Proc -and -not $proxy.Proc.HasExited) {
+        Stop-Process -Id $proxy.Proc.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "  Proxy stopped." -ForegroundColor DarkGray
+    }
+    foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
+        Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+    }
 }

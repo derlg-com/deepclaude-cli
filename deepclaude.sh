@@ -1,17 +1,42 @@
 #!/usr/bin/env bash
 # deepclaude — Use Claude Code with DeepSeek V4 Pro or other cheap backends
-# Usage: deepclaude [--backend ds|or|fw|anthropic] [--remote] [--status] [--cost] [--benchmark]
+# Usage: deepclaude [--backend ds|or|fw|nv|kimi|dw|anthropic] [--remote] [--status] [--cost] [--benchmark]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── Load .env if present ──
+ENV_FILE="$SCRIPT_DIR/proxy/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Strip inline comments (only outside quotes)
+        line="${line%%#*}"
+        # Trim whitespace
+        line="$(echo "$line" | xargs)"
+        [[ -z "$line" ]] && continue
+        # Only export if not already set in environment
+        key="${line%%=*}"
+        if [[ -z "${!key:-}" ]]; then
+            export "$line"
+        fi
+    done < "$ENV_FILE"
+fi
+
 # --- Config ---
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
 OPENROUTER_URL="https://openrouter.ai/api"
 FIREWORKS_URL="https://api.fireworks.ai/inference"
+NVIDIA_URL="https://integrate.api.nvidia.com/v1"
+KIMI_URL="https://api.kimi.com/coding/"
+DOUBLEWORD_URL="https://api.doubleword.ai/v1"
 
-BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
+# Read default from .env API_PROVIDER or fallback to ds
+DEFAULT_BACKEND="${API_PROVIDER:-ds}"
+BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-$DEFAULT_BACKEND}"
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
@@ -50,7 +75,7 @@ resolve_backend() {
             key="${DEEPSEEK_API_KEY:-}"
             [[ -z "$key" ]] && { echo "ERROR: DEEPSEEK_API_KEY not set" >&2; exit 1; }
             url="$DEEPSEEK_URL"
-            opus="deepseek-v4-pro"; sonnet="deepseek-v4-pro"
+            opus="${DEEPSEEK_MODEL:-deepseek-v4-pro}"; sonnet="${DEEPSEEK_MODEL:-deepseek-v4-pro}"
             haiku="deepseek-v4-flash"; subagent="deepseek-v4-flash"
             ;;
         or|openrouter)
@@ -69,8 +94,29 @@ resolve_backend() {
             haiku="accounts/fireworks/models/deepseek-v4-pro"
             subagent="accounts/fireworks/models/deepseek-v4-pro"
             ;;
+        nv|nvidia)
+            key="${NVIDIA_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: NVIDIA_API_KEY not set" >&2; exit 1; }
+            url="$NVIDIA_URL"
+            opus="${NVIDIA_MODEL:-moonshotai/kimi-k2.6}"; sonnet="${NVIDIA_MODEL:-moonshotai/kimi-k2.6}"
+            haiku="${NVIDIA_MODEL:-moonshotai/kimi-k2.6}"; subagent="${NVIDIA_MODEL:-moonshotai/kimi-k2.6}"
+            ;;
+        kimi)
+            key="${KIMI_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: KIMI_API_KEY not set" >&2; exit 1; }
+            url="$KIMI_URL"
+            opus="${KIMI_MODEL:-kimi-for-coding}"; sonnet="${KIMI_MODEL:-kimi-for-coding}"
+            haiku="${KIMI_MODEL:-kimi-for-coding}"; subagent="${KIMI_MODEL:-kimi-for-coding}"
+            ;;
+        dw|doubleword)
+            key="${DOUBLEWORD_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: DOUBLEWORD_API_KEY not set" >&2; exit 1; }
+            url="$DOUBLEWORD_URL"
+            opus="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"; sonnet="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
+            haiku="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"; subagent="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
+            ;;
         anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, nv, kimi, dw, anthropic" >&2; exit 1 ;;
     esac
     RESOLVED_URL="$url"; RESOLVED_KEY="$key"
     RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
@@ -94,14 +140,19 @@ show_status() {
     echo "    DEEPSEEK_API_KEY:    $(mask_key "${DEEPSEEK_API_KEY:-}")"
     echo "    OPENROUTER_API_KEY:  $(mask_key "${OPENROUTER_API_KEY:-}")"
     echo "    FIREWORKS_API_KEY:   $(mask_key "${FIREWORKS_API_KEY:-}")"
+    echo "    NVIDIA_API_KEY:      $(mask_key "${NVIDIA_API_KEY:-}")"
+    echo "    KIMI_API_KEY:        $(mask_key "${KIMI_API_KEY:-}")"
+    echo "    DOUBLEWORD_API_KEY:  $(mask_key "${DOUBLEWORD_API_KEY:-}")"
     echo ""
     echo "  Backends:"
     echo "    deepclaude                  # DeepSeek V4 Pro (default)"
     echo "    deepclaude -b or            # OpenRouter (cheapest)"
     echo "    deepclaude -b fw            # Fireworks AI (fastest)"
+    echo "    deepclaude -b nv            # Nvidia NIM (kimi-k2.6)"
+    echo "    deepclaude -b kimi          # Kimi Code (subscription)"
+    echo "    deepclaude -b dw            # Doubleword AI"
     echo "    deepclaude -b anthropic     # Normal Claude Code"
-    echo "    deepclaude --remote         # Remote control + DeepSeek"
-    echo "    deepclaude --remote -b or   # Remote control + OpenRouter"
+    echo "    deepclaude --remote         # Remote control + default backend"
     echo ""
     local proxy_status
     proxy_status=$(curl -s http://127.0.0.1:3200/_proxy/status 2>/dev/null) || proxy_status=""
@@ -116,15 +167,18 @@ show_status() {
 
 show_cost() {
     echo ""
-    echo "  DeepSeek V4 Pro Pricing"
-    echo "  ======================="
+    echo "  DeepClaude Provider Pricing"
+    echo "  ==========================="
     echo ""
-    echo "  Provider        Input/M    Output/M   Cache Hit/M"
+    echo "  Provider        Input/M    Output/M   Notes"
     echo "  ----------      --------   --------   -----------"
-    echo "  DeepSeek        \$0.44      \$0.87      \$0.004"
-    echo "  OpenRouter      \$0.44      \$0.87      (provider)"
-    echo "  Fireworks       \$1.74      \$3.48      (provider)"
-    echo "  Anthropic       \$3.00      \$15.00     \$0.30"
+    echo "  DeepSeek        \$0.44      \$0.87      Native Anthropic"
+    echo "  OpenRouter      \$0.44      \$0.87      Multi-provider"
+    echo "  Fireworks       \$1.74      \$3.48      Low latency"
+    echo "  Nvidia NIM      \$0.44      \$0.87      OpenAI-compat"
+    echo "  Kimi Code       subscription         Anthropic-native"
+    echo "  Doubleword      \$0.44      \$0.87      OpenAI-compat"
+    echo "  Anthropic       \$3.00      \$15.00     Official"
     echo ""
     echo "  Monthly estimate (heavy use, 25 days): \$30-80"
     echo ""
@@ -136,19 +190,30 @@ show_help() {
     echo "Usage: deepclaude [options] [-- claude-args...]"
     echo ""
     echo "Options:"
-    echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
-    echo "  -r, --remote                        Remote control mode (browser URL)"
-    echo "  --status                             Show keys and backends"
-    echo "  --cost                               Pricing comparison"
-    echo "  --benchmark                          Latency test"
-    echo "  -s, --switch <backend>               Switch proxy mid-session"
-    echo "  -h, --help                           This help"
+    echo "  -b, --backend <backend>  Backend to use (default: ds)"
+    echo "     ds|deepseek           DeepSeek V4 Pro (native Anthropic)"
+    echo "     or|openrouter         OpenRouter (multi-provider)"
+    echo "     fw|fireworks          Fireworks AI (low latency)"
+    echo "     nv|nvidia             Nvidia NIM (OpenAI-compat, kimi-k2.6)"
+    echo "     kimi                  Kimi Code (native Anthropic, subscription)"
+    echo "     dw|doubleword         Doubleword AI (OpenAI-compat)"
+    echo "     anthropic             Normal Claude Code"
+    echo "  -r, --remote             Remote control mode (browser URL)"
+    echo "  --status                 Show keys and backends"
+    echo "  --cost                   Pricing comparison"
+    echo "  --benchmark              Latency test"
+    echo "  -s, --switch <backend>   Switch proxy mid-session"
+    echo "  -h, --help               This help"
     echo ""
     echo "Environment variables:"
-    echo "  DEEPSEEK_API_KEY      DeepSeek API key (required for ds)"
-    echo "  OPENROUTER_API_KEY    OpenRouter API key (required for or)"
-    echo "  FIREWORKS_API_KEY     Fireworks API key (required for fw)"
-    echo "  CHEAPCLAUDE_DEFAULT_BACKEND  Default backend (default: ds)"
+    echo "  DEEPSEEK_API_KEY      DeepSeek API key"
+    echo "  OPENROUTER_API_KEY    OpenRouter API key"
+    echo "  FIREWORKS_API_KEY     Fireworks API key"
+    echo "  NVIDIA_API_KEY        Nvidia NIM API key"
+    echo "  KIMI_API_KEY          Kimi Code API key"
+    echo "  DOUBLEWORD_API_KEY    Doubleword AI API key"
+    echo ""
+    echo "Config: Edit proxy/.env to set API_PROVIDER and API keys."
 }
 
 do_switch() {
@@ -157,8 +222,11 @@ do_switch() {
         ds|deepseek)   backend="deepseek" ;;
         or|openrouter) backend="openrouter" ;;
         fw|fireworks)  backend="fireworks" ;;
+        nv|nvidia)     backend="nvidia" ;;
+        kimi)          backend="kimi" ;;
+        dw|doubleword) backend="doubleword" ;;
         anthropic)     backend="anthropic" ;;
-        *) echo "ERROR: Unknown backend '$backend'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$backend'. Use: ds, or, fw, nv, kimi, dw, anthropic" >&2; exit 1 ;;
     esac
     local resp
     resp=$(curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=$backend" 2>/dev/null) || {
@@ -195,6 +263,27 @@ run_benchmark() {
     echo ""
 }
 
+# ── Determine if backend needs the proxy (OpenAI-compat backends) ──
+needs_proxy() {
+    case "$BACKEND" in
+        nv|nvidia|dw|doubleword) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── Map shorthand backend names to canonical names for the proxy ──
+canonical_backend() {
+    case "$BACKEND" in
+        ds|deepseek)   echo "deepseek" ;;
+        or|openrouter) echo "openrouter" ;;
+        fw|fireworks)  echo "fireworks" ;;
+        nv|nvidia)     echo "nvidia" ;;
+        kimi)          echo "kimi" ;;
+        dw|doubleword) echo "doubleword" ;;
+        *)             echo "$BACKEND" ;;
+    esac
+}
+
 launch_claude() {
     if [[ "$BACKEND" == "anthropic" ]]; then
         echo "  Launching Claude Code (normal Anthropic backend)..."
@@ -212,6 +301,64 @@ launch_claude() {
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
+    # OpenAI-compat backends (nvidia, doubleword) MUST go through the proxy
+    # for Anthropic↔OpenAI format translation.
+    # Kimi and other native-Anthropic backends can connect directly.
+    if needs_proxy; then
+        echo "  Starting translation proxy for $BACKEND..."
+
+        # Pass all env vars so proxy can find the keys
+        export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+        export KIMI_API_KEY="${KIMI_API_KEY:-}"
+        export DOUBLEWORD_API_KEY="${DOUBLEWORD_API_KEY:-}"
+        export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
+        export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+        export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-}"
+
+        local canonical
+        canonical=$(canonical_backend)
+
+        local port_file
+        port_file=$(mktemp)
+        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" --mode "$canonical" > "$port_file" 2>&1 &
+        PROXY_PID=$!
+
+        local tries=0
+        while [[ ! -s "$port_file" ]] && [[ $tries -lt 30 ]]; do
+            sleep 0.2
+            tries=$((tries + 1))
+        done
+
+        if [[ ! -s "$port_file" ]]; then
+            echo "ERROR: Proxy failed to start" >&2
+            cat "$port_file" >&2 2>/dev/null || true
+            rm -f "$port_file"
+            exit 1
+        fi
+
+        # The proxy outputs the port number on the first line
+        local proxy_port
+        proxy_port=$(head -1 "$port_file" | grep -oE '[0-9]+' | head -1)
+        rm -f "$port_file"
+
+        if [[ -z "$proxy_port" ]]; then
+            echo "ERROR: Could not determine proxy port" >&2
+            exit 1
+        fi
+
+        echo "  Proxy on :$proxy_port → $RESOLVED_URL"
+        echo ""
+
+        export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
+        # The proxy handles auth, so we use a dummy token
+        export ANTHROPIC_AUTH_TOKEN="proxy-managed"
+        set_model_env
+        unset ANTHROPIC_API_KEY
+
+        exec claude "$@"
+    fi
+
+    # Native Anthropic-format backends (deepseek, openrouter, fireworks, kimi)
     export ANTHROPIC_BASE_URL="$RESOLVED_URL"
     export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
     set_model_env
@@ -233,6 +380,14 @@ launch_remote() {
     resolve_backend
 
     echo "  Starting model proxy for $BACKEND..."
+
+    # Pass all env vars so proxy can find the keys
+    export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+    export KIMI_API_KEY="${KIMI_API_KEY:-}"
+    export DOUBLEWORD_API_KEY="${DOUBLEWORD_API_KEY:-}"
+    export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
+    export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+    export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-}"
 
     local port_file
     port_file=$(mktemp)

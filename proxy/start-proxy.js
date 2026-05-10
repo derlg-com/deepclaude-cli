@@ -5,6 +5,9 @@ const BACKEND_DEFS = {
     deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
     fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
+    kimi: { url: 'https://api.kimi.com/coding/', keyEnv: 'KIMI_API_KEY' },
+    nvidia: { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
+    doubleword: { url: 'https://api.doubleword.ai/v1', keyEnv: 'DOUBLEWORD_API_KEY' },
 };
 
 // Legacy mode: start-proxy.js <targetUrl> <apiKey> (used by deepclaude.sh/ps1)

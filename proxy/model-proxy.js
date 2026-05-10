@@ -2,6 +2,7 @@ import { createServer } from 'http';
 import { request as httpsRequest } from 'https';
 import { URL } from 'url';
 import { Transform } from 'stream';
+import { anthropicToOpenAI, openAIToAnthropic, OpenAIToAnthropicStream, fixResponseHeaders } from './openai-translator.js';
 
 const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const MODEL_PATHS = ['/v1/messages'];
@@ -22,15 +23,54 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
         'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
     },
+    // Kimi uses native Anthropic format — model is always kimi-for-coding
+    kimi: {
+        'claude-opus-4-6':    'kimi-for-coding',
+        'claude-opus-4-7':    'kimi-for-coding',
+        'claude-sonnet-4-6':  'kimi-for-coding',
+        'claude-sonnet-4-5-20250929': 'kimi-for-coding',
+        'claude-haiku-4-5-20251001':  'kimi-for-coding',
+    },
+    // Nvidia uses OpenAI format — needs translation
+    nvidia: {
+        'claude-opus-4-6':    'moonshotai/kimi-k2.6',
+        'claude-opus-4-7':    'moonshotai/kimi-k2.6',
+        'claude-sonnet-4-6':  'moonshotai/kimi-k2.6',
+        'claude-sonnet-4-5-20250929': 'moonshotai/kimi-k2.6',
+        'claude-haiku-4-5-20251001':  'moonshotai/kimi-k2.6',
+    },
+    // Doubleword uses OpenAI format — needs translation
+    doubleword: {
+        'claude-opus-4-6':    'deepseek-ai/DeepSeek-V4-Pro',
+        'claude-opus-4-7':    'deepseek-ai/DeepSeek-V4-Pro',
+        'claude-sonnet-4-6':  'deepseek-ai/DeepSeek-V4-Pro',
+        'claude-sonnet-4-5-20250929': 'deepseek-ai/DeepSeek-V4-Pro',
+        'claude-haiku-4-5-20251001':  'deepseek-ai/DeepSeek-V4-Pro',
+    },
 };
 
 const PRICING_PER_M = {
     deepseek:   { input: 0.44,  output: 0.87 },
     openrouter: { input: 0.44,  output: 0.87 },
     fireworks:  { input: 1.74,  output: 3.48 },
+    nvidia:     { input: 0.44,  output: 0.87 },
+    kimi:       { input: 0.00,  output: 0.00 },  // subscription-based
+    doubleword: { input: 0.44,  output: 0.87 },
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
+
+/**
+ * Backends that use OpenAI Chat Completions format instead of Anthropic
+ * Messages format. These require full request/response translation.
+ */
+const OPENAI_COMPAT_BACKENDS = new Set(['nvidia', 'doubleword']);
+
+/**
+ * Backends that need anthropic-beta and other Anthropic-specific headers
+ * stripped (they reject unknown headers).
+ */
+const STRIP_ANTHROPIC_HEADERS = new Set(['kimi', 'nvidia', 'doubleword']);
 
 /**
  * Transform stream that intercepts SSE events and injects missing `usage`
@@ -125,7 +165,8 @@ function stripUnsignedThinkingBlocks(body) {
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
-        const initialBearer = targetUrl.includes('openrouter') || targetUrl.includes('fireworks');
+        const initialBearer = targetUrl.includes('openrouter') || targetUrl.includes('fireworks')
+            || targetUrl.includes('nvidia') || targetUrl.includes('doubleword');
 
         const allBackends = {};
         if (backends) {
@@ -133,7 +174,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 allBackends[name] = {
                     target: new URL(cfg.url),
                     apiKey: cfg.apiKey,
-                    useBearer: cfg.url.includes('openrouter') || cfg.url.includes('fireworks'),
+                    useBearer: cfg.url.includes('openrouter') || cfg.url.includes('fireworks')
+                        || cfg.url.includes('nvidia') || cfg.url.includes('doubleword'),
                 };
             }
         }
@@ -273,19 +315,23 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             // In anthropic mode, everything passes through transparently
             const isAnthropicMode = state.mode === 'anthropic';
             const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
+            const isOpenAICompat = isModelCall && OPENAI_COMPAT_BACKENDS.has(state.mode);
             const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
 
-            // Build upstream path. target.pathname may overlap with
-            // clientReq.url (e.g. OpenRouter /api/v1 + /v1/messages).
-            // Strip the shared prefix to avoid /api/v1/v1/messages.
+            // Build upstream path
             let fullPath;
             if (isModelCall) {
-                const base = state.target.pathname.replace(/\/$/, '');
-                let overlap = '';
-                for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
-                    if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                if (isOpenAICompat) {
+                    // OpenAI-compatible: always POST to /v1/chat/completions
+                    fullPath = '/v1/chat/completions';
+                } else {
+                    const base = state.target.pathname.replace(/\/$/, '');
+                    let overlap = '';
+                    for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
+                        if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                    }
+                    fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
                 }
-                fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
             } else {
                 fullPath = clientReq.url;
             }
@@ -294,7 +340,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const t0 = Date.now();
 
             if (isModelCall) {
-                console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}`);
+                console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath} (${state.mode}${isOpenAICompat ? ', OpenAI-compat' : ''})`);
             }
 
             const headers = { ...clientReq.headers, host: dest.host };
@@ -308,35 +354,51 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 } else {
                     headers['x-api-key'] = state.apiKey;
                 }
+
+                // Strip Anthropic-specific headers that some backends reject
+                if (STRIP_ANTHROPIC_HEADERS.has(state.mode)) {
+                    delete headers['anthropic-beta'];
+                }
+
+                // OpenAI-compat backends need different content negotiation
+                if (isOpenAICompat) {
+                    delete headers['anthropic-version'];
+                    delete headers['anthropic-beta'];
+                    headers['content-type'] = 'application/json';
+                    // For streaming, set Accept header
+                    headers['accept'] = 'text/event-stream';
+                }
             }
 
             const chunks = [];
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
+                let parsedAnthropicBody = null;
+                let targetModel = null;
 
-                // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
+                // Parse and remap model names
+                if (isModelCall) {
                     try {
-                        const parsed = JSON.parse(body);
-                        const mapped = MODEL_REMAP[state.mode][parsed.model];
-                        if (mapped) {
-                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
-                            parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
-                        }
-                    } catch { /* not JSON or parse error, pass through */ }
+                        parsedAnthropicBody = JSON.parse(body);
+                    } catch { /* pass through */ }
                 }
 
-                // Strip thinking blocks before forwarding.
-                // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
-                // they didn't generate, even unsigned ones.
-                // Anthropic after a non-Anthropic session: also strip ALL, because
-                // foreign backends generate signed-but-invalid thinking blocks that
-                // stripUnsignedThinkingBlocks passes through, causing Anthropic 400s.
+                if (isModelCall && parsedAnthropicBody && MODEL_REMAP[state.mode]) {
+                    const mapped = MODEL_REMAP[state.mode][parsedAnthropicBody.model];
+                    if (mapped) {
+                        console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsedAnthropicBody.model} → ${mapped}`);
+                        parsedAnthropicBody.model = mapped;
+                        targetModel = mapped;
+                    } else {
+                        targetModel = parsedAnthropicBody.model;
+                    }
+                }
+
+                // Strip thinking blocks before forwarding
                 if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
                     try {
-                        const parsed = JSON.parse(body);
+                        const parsed = parsedAnthropicBody || JSON.parse(body);
                         if (state.hadNonAnthropicSession) {
                             stripAllThinkingBlocks(parsed);
                         } else {
@@ -345,12 +407,17 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* pass through */ }
                 }
-                if (isModelCall) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        stripAllThinkingBlocks(parsed);
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
+                if (isModelCall && parsedAnthropicBody) {
+                    stripAllThinkingBlocks(parsedAnthropicBody);
+                }
+
+                // Translate to OpenAI format for OpenAI-compat backends
+                if (isOpenAICompat && parsedAnthropicBody) {
+                    const openaiBody = anthropicToOpenAI(parsedAnthropicBody, targetModel || parsedAnthropicBody.model);
+                    body = Buffer.from(JSON.stringify(openaiBody));
+                    console.log(`[MODEL-PROXY] #${reqId} translated Anthropic→OpenAI (stream=${openaiBody.stream})`);
+                } else if (isModelCall && parsedAnthropicBody) {
+                    body = Buffer.from(JSON.stringify(parsedAnthropicBody));
                 }
 
                 const opts = {
@@ -368,9 +435,71 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
                     }
 
+                    // Log error responses for debugging
+                    if (isModelCall && proxyRes.statusCode >= 400) {
+                        const errChunks = [];
+                        proxyRes.on('data', c => errChunks.push(c));
+                        proxyRes.on('end', () => {
+                            const errBody = Buffer.concat(errChunks).toString();
+                            console.error(`[MODEL-PROXY] #${reqId} ERROR ${proxyRes.statusCode}: ${errBody.substring(0, 500)}`);
+                            // Return error as Anthropic-format error
+                            const errorResp = {
+                                type: 'error',
+                                error: {
+                                    type: 'api_error',
+                                    message: `Upstream ${state.mode} returned ${proxyRes.statusCode}: ${errBody.substring(0, 200)}`,
+                                },
+                            };
+                            clientRes.writeHead(proxyRes.statusCode, { 'content-type': 'application/json' });
+                            clientRes.end(JSON.stringify(errorResp));
+                        });
+                        return;
+                    }
+
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
 
+                    // ── OpenAI-compat streaming → translate back to Anthropic SSE ──
+                    if (isModelCall && isOpenAICompat && isSSE) {
+                        const anthropicHeaders = fixResponseHeaders(proxyRes.headers, true);
+                        clientRes.writeHead(proxyRes.statusCode, anthropicHeaders);
+                        const translator = new OpenAIToAnthropicStream(
+                            targetModel || parsedAnthropicBody?.model,
+                            (inp, out) => recordUsage(state.mode, inp, out)
+                        );
+                        proxyRes.pipe(translator).pipe(clientRes);
+                        proxyRes.on('end', () => {
+                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic SSE, ${translator._inputTokens}in/${translator._outputTokens}out)`);
+                        });
+                        return;
+                    }
+
+                    // ── OpenAI-compat JSON → translate back to Anthropic JSON ──
+                    if (isModelCall && isOpenAICompat && ct.includes('application/json')) {
+                        const respChunks = [];
+                        proxyRes.on('data', c => respChunks.push(c));
+                        proxyRes.on('end', () => {
+                            const raw = Buffer.concat(respChunks);
+                            try {
+                                const openaiResp = JSON.parse(raw);
+                                const anthropicResp = openAIToAnthropic(openaiResp, targetModel || parsedAnthropicBody?.model);
+                                recordUsage(state.mode, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+                                const fixed = Buffer.from(JSON.stringify(anthropicResp));
+                                const outHeaders = fixResponseHeaders(proxyRes.headers, false);
+                                outHeaders['content-length'] = fixed.length;
+                                clientRes.writeHead(proxyRes.statusCode, outHeaders);
+                                clientRes.end(fixed);
+                                console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic JSON)`);
+                            } catch (e) {
+                                console.error(`[MODEL-PROXY] #${reqId} translation error: ${e.message}`);
+                                clientRes.writeHead(502, { 'content-type': 'application/json' });
+                                clientRes.end(JSON.stringify({ error: { message: 'Translation error' } }));
+                            }
+                        });
+                        return;
+                    }
+
+                    // ── Native Anthropic SSE (DeepSeek, Kimi, OpenRouter) ──
                     if (isModelCall && isSSE) {
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                         const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
