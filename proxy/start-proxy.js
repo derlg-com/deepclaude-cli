@@ -65,7 +65,7 @@ if (targetUrl && apiKey) {
         defaultMode,
     });
 
-    console.log(`Proxy on :${proxy.port} (mode: ${defaultMode})`);
-    console.log(`Switch: curl -sX POST http://127.0.0.1:${proxy.port}/_proxy/mode -d backend=deepseek`);
-    console.log(`Status: curl -s http://127.0.0.1:${proxy.port}/_proxy/status`);
+    console.error(`Proxy on :${proxy.port} (mode: ${defaultMode})`);
+    console.error(`Switch: curl -sX POST http://127.0.0.1:${proxy.port}/_proxy/mode -d backend=deepseek`);
+    console.error(`Status: curl -s http://127.0.0.1:${proxy.port}/_proxy/status`);
 }

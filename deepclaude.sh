@@ -320,7 +320,8 @@ launch_claude() {
 
         local port_file
         port_file=$(mktemp)
-        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" --mode "$canonical" > "$port_file" 2>&1 &
+        # stdout = port number only; stderr = proxy logs (to terminal)
+        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" --mode "$canonical" > "$port_file" 2>/dev/null &
         PROXY_PID=$!
 
         local tries=0
@@ -336,9 +337,9 @@ launch_claude() {
             exit 1
         fi
 
-        # The proxy outputs the port number on the first line
+        # Extract the bare port number (only digits on a line by itself)
         local proxy_port
-        proxy_port=$(head -1 "$port_file" | grep -oE '[0-9]+' | head -1)
+        proxy_port=$(grep -oE '^[0-9]+$' "$port_file" | head -1)
         rm -f "$port_file"
 
         if [[ -z "$proxy_port" ]]; then
@@ -391,7 +392,7 @@ launch_remote() {
 
     local port_file
     port_file=$(mktemp)
-    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" &
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" 2>/dev/null &
     PROXY_PID=$!
 
     local tries=0
@@ -407,7 +408,7 @@ launch_remote() {
     fi
 
     local proxy_port
-    proxy_port=$(head -1 "$port_file")
+    proxy_port=$(grep -oE '^[0-9]+$' "$port_file" | head -1)
     rm -f "$port_file"
 
     echo "  Proxy on :$proxy_port -> $RESOLVED_URL"

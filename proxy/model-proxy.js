@@ -296,7 +296,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             clientRes.end(JSON.stringify(result));
                             return;
                         }
-                        console.log(`[MODEL-PROXY] Mode switched: ${result.previous} → ${result.mode}`);
+                        console.error(`[MODEL-PROXY] Mode switched: ${result.previous} → ${result.mode}`);
                         clientRes.writeHead(200, { 'content-type': 'application/json' });
                         clientRes.end(JSON.stringify(result));
                     });
@@ -340,7 +340,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const t0 = Date.now();
 
             if (isModelCall) {
-                console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath} (${state.mode}${isOpenAICompat ? ', OpenAI-compat' : ''})`);
+                console.error(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath} (${state.mode}${isOpenAICompat ? ', OpenAI-compat' : ''})`);
             }
 
             const headers = { ...clientReq.headers, host: dest.host };
@@ -387,7 +387,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 if (isModelCall && parsedAnthropicBody && MODEL_REMAP[state.mode]) {
                     const mapped = MODEL_REMAP[state.mode][parsedAnthropicBody.model];
                     if (mapped) {
-                        console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsedAnthropicBody.model} → ${mapped}`);
+                        console.error(`[MODEL-PROXY] #${reqId} model remap: ${parsedAnthropicBody.model} → ${mapped}`);
                         parsedAnthropicBody.model = mapped;
                         targetModel = mapped;
                     } else {
@@ -415,7 +415,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 if (isOpenAICompat && parsedAnthropicBody) {
                     const openaiBody = anthropicToOpenAI(parsedAnthropicBody, targetModel || parsedAnthropicBody.model);
                     body = Buffer.from(JSON.stringify(openaiBody));
-                    console.log(`[MODEL-PROXY] #${reqId} translated Anthropic→OpenAI (stream=${openaiBody.stream})`);
+                    console.error(`[MODEL-PROXY] #${reqId} translated Anthropic→OpenAI (stream=${openaiBody.stream})`);
                 } else if (isModelCall && parsedAnthropicBody) {
                     body = Buffer.from(JSON.stringify(parsedAnthropicBody));
                 }
@@ -432,7 +432,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const proxyReq = httpsRequest(opts, (proxyRes) => {
                     if (isModelCall) {
                         const ttfb = Date.now() - t0;
-                        console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
+                        console.error(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
                     }
 
                     // Log error responses for debugging
@@ -469,7 +469,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         );
                         proxyRes.pipe(translator).pipe(clientRes);
                         proxyRes.on('end', () => {
-                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic SSE, ${translator._inputTokens}in/${translator._outputTokens}out)`);
+                            console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic SSE, ${translator._inputTokens}in/${translator._outputTokens}out)`);
                         });
                         return;
                     }
@@ -489,7 +489,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                                 outHeaders['content-length'] = fixed.length;
                                 clientRes.writeHead(proxyRes.statusCode, outHeaders);
                                 clientRes.end(fixed);
-                                console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic JSON)`);
+                                console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (OpenAI→Anthropic JSON)`);
                             } catch (e) {
                                 console.error(`[MODEL-PROXY] #${reqId} translation error: ${e.message}`);
                                 clientRes.writeHead(502, { 'content-type': 'application/json' });
@@ -505,7 +505,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
                         proxyRes.pipe(norm).pipe(clientRes);
                         proxyRes.on('end', () => {
-                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
+                            console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
                         });
                     } else if (isModelCall && ct.includes('application/json')) {
                         const respChunks = [];
@@ -520,7 +520,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
                             clientRes.writeHead(proxyRes.statusCode, outHeaders);
                             clientRes.end(fixed);
-                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)`);
+                            console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)`);
                         });
                     } else {
                         // Non-model or unknown content-type: pass through
@@ -528,7 +528,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         proxyRes.pipe(clientRes);
                         if (isModelCall) {
                             proxyRes.on('end', () => {
-                                console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+                                console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
                             });
                         }
                     }
@@ -562,7 +562,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             });
             server.listen(port, '127.0.0.1', () => {
                 const actualPort = server.address().port;
-                console.log(`[MODEL-PROXY] Listening on 127.0.0.1:${actualPort} → ${targetUrl} (mode: ${state.mode})`);
+                console.error(`[MODEL-PROXY] Listening on 127.0.0.1:${actualPort} → ${targetUrl} (mode: ${state.mode})`);
                 resolve({ port: actualPort, close: () => server.close(), switchMode });
             });
         }
