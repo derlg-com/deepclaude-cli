@@ -10,42 +10,52 @@ const BACKEND_DEFS = {
     doubleword: { url: 'https://api.doubleword.ai/v1', keyEnv: 'DOUBLEWORD_API_KEY' },
 };
 
-// Legacy mode: start-proxy.js <targetUrl> <apiKey> (used by deepclaude.sh/ps1)
-const targetUrl = process.argv[2] || process.env.CHEAPCLAUDE_TARGET_URL;
-const apiKey = process.argv[3] || process.env.CHEAPCLAUDE_API_KEY;
+// Parse --mode from argv regardless of position
+const allArgs = process.argv.slice(2);
+const modeIdx = allArgs.indexOf('--mode');
+const cliMode = modeIdx >= 0 ? allArgs[modeIdx + 1] : null;
+const portIdx = allArgs.indexOf('--port');
+const cliPort = portIdx >= 0 ? parseInt(allArgs[portIdx + 1], 10) : null;
+
+// Filter out flags to get positional args
+const positional = allArgs.filter((a, i) => {
+    if (a === '--mode' || a === '--port') return false;
+    if (i > 0 && (allArgs[i - 1] === '--mode' || allArgs[i - 1] === '--port')) return false;
+    return true;
+});
+
+const targetUrl = positional[0] || process.env.CHEAPCLAUDE_TARGET_URL;
+const apiKey = positional[1] || process.env.CHEAPCLAUDE_API_KEY;
+
+// Build backends from env vars
+const backends = {};
+for (const [name, def] of Object.entries(BACKEND_DEFS)) {
+    const key = process.env[def.keyEnv];
+    if (key || !(targetUrl && apiKey)) {
+        backends[name] = { url: def.url, apiKey: key || null };
+    }
+}
 
 if (targetUrl && apiKey) {
-    // Legacy single-backend mode
-    const backends = {};
-    for (const [name, def] of Object.entries(BACKEND_DEFS)) {
-        const key = process.env[def.keyEnv];
-        if (key) backends[name] = { url: def.url, apiKey: key };
-    }
+    // Legacy-compatible mode: URL + key provided as positional args
+    // Now also respects --mode flag for setting the default backend
     const hasBackends = Object.keys(backends).length > 0;
+    const defaultMode = cliMode || undefined;
 
     const { port } = await startModelProxy({
         targetUrl,
         apiKey,
+        startPort: cliPort || 3200,
         backends: hasBackends ? backends : undefined,
-        defaultMode: hasBackends ? undefined : undefined,
+        defaultMode,
     });
     console.log(port);
 } else {
     // Standalone mode with live toggle
-    const backends = {};
-    for (const [name, def] of Object.entries(BACKEND_DEFS)) {
-        const key = process.env[def.keyEnv];
-        backends[name] = { url: def.url, apiKey: key || null };
-    }
-
     const fallbackUrl = backends.deepseek?.url || 'https://api.deepseek.com/anthropic';
     const fallbackKey = backends.deepseek?.apiKey || 'unused';
-
-    const args = process.argv.slice(2);
-    const modeFlag = args.indexOf('--mode');
-    const defaultMode = modeFlag >= 0 ? args[modeFlag + 1] : 'anthropic';
-    const portFlag = args.indexOf('--port');
-    const port = portFlag >= 0 ? parseInt(args[portFlag + 1], 10) : 3200;
+    const defaultMode = cliMode || 'anthropic';
+    const port = cliPort || 3200;
 
     const proxy = await startModelProxy({
         targetUrl: fallbackUrl,

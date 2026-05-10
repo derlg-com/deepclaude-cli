@@ -264,9 +264,14 @@ export function openAIToAnthropic(openaiResp, requestModel) {
     const content = [];
     const message = choice.message;
 
-    // Text content
+    // Text content — check both content and reasoning fields
+    // Doubleword/some providers return reasoning in a separate field
+    // when content is null
     if (message.content) {
         content.push({ type: 'text', text: message.content });
+    } else if (message.reasoning) {
+        // Doubleword returns reasoning text when content is null
+        content.push({ type: 'text', text: message.reasoning });
     }
 
     // Tool calls → Anthropic tool_use blocks
@@ -369,19 +374,22 @@ export class OpenAIToAnthropicStream extends Transform {
             this._processLine(this._buf.trim());
         }
 
-        // Close any open blocks
-        if (this._currentBlockIndex >= 0) {
-            this._emitEvent('content_block_stop', { type: 'content_block_stop', index: this._currentBlockIndex });
-        }
+        // Only emit closing events if we haven't already finished
+        if (!this._finished) {
+            // Close any open blocks
+            if (this._currentBlockIndex >= 0 && this._currentBlockType !== null) {
+                this._emitEvent('content_block_stop', { type: 'content_block_stop', index: this._currentBlockIndex });
+            }
 
-        // Emit message_delta and message_stop if we started
-        if (this._started) {
-            this._emitEvent('message_delta', {
-                type: 'message_delta',
-                delta: { stop_reason: 'end_turn', stop_sequence: null },
-                usage: { output_tokens: this._outputTokens },
-            });
-            this._emitEvent('message_stop', { type: 'message_stop' });
+            // Emit message_delta and message_stop if we started
+            if (this._started) {
+                this._emitEvent('message_delta', {
+                    type: 'message_delta',
+                    delta: { stop_reason: 'end_turn', stop_sequence: null },
+                    usage: { output_tokens: this._outputTokens },
+                });
+                this._emitEvent('message_stop', { type: 'message_stop' });
+            }
         }
 
         if (this._onUsage) {
@@ -406,7 +414,7 @@ export class OpenAIToAnthropicStream extends Transform {
         }
 
         // Emit message_start on first chunk
-        if (!this._started) {
+        if (!this._started && !this._finished) {
             this._started = true;
             this._emitEvent('message_start', {
                 type: 'message_start',
@@ -423,11 +431,14 @@ export class OpenAIToAnthropicStream extends Transform {
             });
         }
 
-        // Track usage from stream_options
+        // Track usage from stream_options (even after finished)
         if (parsed.usage) {
             this._inputTokens = parsed.usage.prompt_tokens || this._inputTokens;
             this._outputTokens = parsed.usage.completion_tokens || this._outputTokens;
         }
+
+        // After we've finished, only capture usage — don't emit more events
+        if (this._finished) return;
 
         const choice = parsed.choices?.[0];
         if (!choice) return;
@@ -435,8 +446,14 @@ export class OpenAIToAnthropicStream extends Transform {
         const delta = choice.delta || {};
         const finishReason = choice.finish_reason;
 
-        // Handle text content
-        if (delta.content !== undefined && delta.content !== null) {
+        // Handle text content from delta.content
+        // Doubleword sends content: "" (empty) + reasoning: "..." during thinking.
+        // We SKIP reasoning-only chunks — they're internal thinking, not output.
+        // Only emit when content has actual text (non-empty string).
+        const hasContent = delta.content !== undefined && delta.content !== null;
+        const hasActualContent = hasContent && delta.content !== '';
+
+        if (hasActualContent) {
             if (!this._textStarted) {
                 this._textStarted = true;
                 this._currentBlockIndex++;
@@ -447,13 +464,11 @@ export class OpenAIToAnthropicStream extends Transform {
                     content_block: { type: 'text', text: '' },
                 });
             }
-            if (delta.content) {
-                this._emitEvent('content_block_delta', {
-                    type: 'content_block_delta',
-                    index: this._currentBlockIndex,
-                    delta: { type: 'text_delta', text: delta.content },
-                });
-            }
+            this._emitEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: this._currentBlockIndex,
+                delta: { type: 'text_delta', text: delta.content },
+            });
         }
 
         // Handle tool calls
@@ -514,9 +529,13 @@ export class OpenAIToAnthropicStream extends Transform {
         }
 
         // Handle finish_reason
-        if (finishReason) {
+        // Doubleword sends TWO chunks with finish_reason (one without usage,
+        // one with usage). Only emit message end events once.
+        if (finishReason && !this._finished) {
+            this._finished = true;
+
             // Close open block
-            if (this._currentBlockIndex >= 0) {
+            if (this._currentBlockIndex >= 0 && this._currentBlockType !== null) {
                 this._emitEvent('content_block_stop', {
                     type: 'content_block_stop',
                     index: this._currentBlockIndex,
