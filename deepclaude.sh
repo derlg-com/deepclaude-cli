@@ -33,6 +33,7 @@ FIREWORKS_URL="https://api.fireworks.ai/inference"
 NVIDIA_URL="https://integrate.api.nvidia.com/v1"
 KIMI_URL="https://api.kimi.com/coding/"
 DOUBLEWORD_URL="https://api.doubleword.ai/v1"
+KIROCC_PORT=3456  # Port for kirocc gateway (Kiro backend)
 
 # Read default from .env API_PROVIDER or fallback to ds
 DEFAULT_BACKEND="${API_PROVIDER:-ds}"
@@ -115,8 +116,16 @@ resolve_backend() {
             opus="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"; sonnet="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
             haiku="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"; subagent="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
             ;;
+        kiro)
+            # Kiro uses kirocc gateway — no API key needed (uses Kiro CLI auth)
+            # Model names must use dot notation without date suffixes
+            url="http://127.0.0.1:$KIROCC_PORT"
+            key="dummy"  # kirocc ignores this unless -api-key is set
+            opus="${KIRO_MODEL:-claude-sonnet-4.5}"; sonnet="${KIRO_MODEL:-claude-sonnet-4.5}"
+            haiku="${KIRO_MODEL:-claude-haiku-4.5}"; subagent="${KIRO_MODEL:-claude-haiku-4.5}"
+            ;;
         anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, nv, kimi, dw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" >&2; exit 1 ;;
     esac
     RESOLVED_URL="$url"; RESOLVED_KEY="$key"
     RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
@@ -143,6 +152,8 @@ show_status() {
     echo "    NVIDIA_API_KEY:      $(mask_key "${NVIDIA_API_KEY:-}")"
     echo "    KIMI_API_KEY:        $(mask_key "${KIMI_API_KEY:-}")"
     echo "    DOUBLEWORD_API_KEY:  $(mask_key "${DOUBLEWORD_API_KEY:-}")"
+    echo "    KIRO_API_KEY:        $(mask_key "${KIRO_API_KEY:-}")"
+    echo "    kirocc:              $(which kirocc 2>/dev/null && echo 'installed' || echo 'NOT FOUND')"
     echo ""
     echo "  Backends:"
     echo "    deepclaude                  # DeepSeek V4 Pro (default)"
@@ -151,6 +162,7 @@ show_status() {
     echo "    deepclaude -b nv            # Nvidia NIM (kimi-k2.6)"
     echo "    deepclaude -b kimi          # Kimi Code (subscription)"
     echo "    deepclaude -b dw            # Doubleword AI"
+    echo "    deepclaude -b kiro          # Kiro (AWS Claude, via kirocc)"
     echo "    deepclaude -b anthropic     # Normal Claude Code"
     echo "    deepclaude --remote         # Remote control + default backend"
     echo ""
@@ -178,6 +190,7 @@ show_cost() {
     echo "  Nvidia NIM      \$0.44      \$0.87      OpenAI-compat"
     echo "  Kimi Code       subscription         Anthropic-native"
     echo "  Doubleword      \$0.44      \$0.87      OpenAI-compat"
+    echo "  Kiro            subscription         AWS Claude (kirocc)"
     echo "  Anthropic       \$3.00      \$15.00     Official"
     echo ""
     echo "  Monthly estimate (heavy use, 25 days): \$30-80"
@@ -197,6 +210,7 @@ show_help() {
     echo "     nv|nvidia             Nvidia NIM (OpenAI-compat, kimi-k2.6)"
     echo "     kimi                  Kimi Code (native Anthropic, subscription)"
     echo "     dw|doubleword         Doubleword AI (OpenAI-compat)"
+    echo "     kiro                  Kiro (AWS Claude via kirocc gateway)"
     echo "     anthropic             Normal Claude Code"
     echo "  -r, --remote             Remote control mode (browser URL)"
     echo "  --status                 Show keys and backends"
@@ -212,6 +226,7 @@ show_help() {
     echo "  NVIDIA_API_KEY        Nvidia NIM API key"
     echo "  KIMI_API_KEY          Kimi Code API key"
     echo "  DOUBLEWORD_API_KEY    Doubleword AI API key"
+    echo "  KIRO_API_KEY          Kiro API key (ksk_ prefix)"
     echo ""
     echo "Config: Edit proxy/.env to set API_PROVIDER and API keys."
 }
@@ -263,10 +278,18 @@ run_benchmark() {
     echo ""
 }
 
-# ── Determine if backend needs the proxy (OpenAI-compat backends) ──
+# ── Determine if backend needs the Node.js proxy (OpenAI-compat backends) ──
 needs_proxy() {
     case "$BACKEND" in
         nv|nvidia|dw|doubleword) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── Determine if backend needs the kirocc gateway ──
+needs_kirocc() {
+    case "$BACKEND" in
+        kiro) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -280,6 +303,7 @@ canonical_backend() {
         nv|nvidia)     echo "nvidia" ;;
         kimi)          echo "kimi" ;;
         dw|doubleword) echo "doubleword" ;;
+        kiro)          echo "kiro" ;;
         *)             echo "$BACKEND" ;;
     esac
 }
@@ -300,6 +324,44 @@ launch_claude() {
     echo "  Endpoint: $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
+
+    # Kiro backend: start kirocc gateway (Go binary, Anthropic↔AWS Event Stream).
+    if needs_kirocc; then
+        local kirocc_bin
+        kirocc_bin=$(which kirocc 2>/dev/null || echo "$HOME/.local/bin/kirocc")
+        if [[ ! -x "$kirocc_bin" ]]; then
+            echo "ERROR: kirocc not found. Install with:" >&2
+            echo "  GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest" >&2
+            exit 1
+        fi
+
+        echo "  Starting kirocc gateway on :$KIROCC_PORT..."
+        "$kirocc_bin" -port "$KIROCC_PORT" > /dev/null 2>&1 &
+        PROXY_PID=$!
+
+        # Wait for kirocc to be ready
+        local tries=0
+        while ! curl -s "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
+            sleep 0.3
+            tries=$((tries + 1))
+        done
+
+        if ! curl -s "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
+            echo "ERROR: kirocc failed to start on port $KIROCC_PORT" >&2
+            exit 1
+        fi
+
+        echo "  kirocc ready → Kiro (AWS Claude)"
+        echo ""
+
+        export ANTHROPIC_BASE_URL="http://127.0.0.1:$KIROCC_PORT"
+        export ANTHROPIC_AUTH_TOKEN="kiro-managed"
+        # Override model names with dot-notation IDs that Kiro accepts
+        set_model_env
+        unset ANTHROPIC_API_KEY
+
+        exec claude "$@"
+    fi
 
     # OpenAI-compat backends (nvidia, doubleword) MUST go through the proxy
     # for Anthropic↔OpenAI format translation.
@@ -381,6 +443,32 @@ launch_remote() {
     resolve_backend
 
     echo "  Starting model proxy for $BACKEND..."
+
+    # Kiro backend: use kirocc for remote mode too
+    if needs_kirocc; then
+        local kirocc_bin
+        kirocc_bin=$(which kirocc 2>/dev/null || echo "$HOME/.local/bin/kirocc")
+        if [[ ! -x "$kirocc_bin" ]]; then
+            echo "ERROR: kirocc not found." >&2; exit 1
+        fi
+
+        "$kirocc_bin" -port "$KIROCC_PORT" > /dev/null 2>&1 &
+        PROXY_PID=$!
+        local tries=0
+        while ! curl -s "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
+            sleep 0.3; tries=$((tries + 1))
+        done
+
+        echo "  kirocc ready → Kiro (AWS Claude)"
+        echo "  Launching remote control via kiro..."
+        echo ""
+
+        export ANTHROPIC_BASE_URL="http://127.0.0.1:$KIROCC_PORT"
+        unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+        claude remote-control "$@"
+        return
+    fi
 
     # Pass all env vars so proxy can find the keys
     export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
