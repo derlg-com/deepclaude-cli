@@ -335,6 +335,58 @@ launch_claude() {
             exit 1
         fi
 
+        # When KIRO_API_KEY (ksk_...) is set, kirocc uses it directly — no OAuth or DB needed.
+        # Otherwise, kirocc reads OAuth tokens from Kiro CLI's SQLite DB.
+        if [[ -n "${KIRO_API_KEY:-}" ]]; then
+            echo "  Using KIRO_API_KEY for authentication (no OAuth required)"
+        else
+            local kiro_db="$HOME/.local/share/kiro-cli/data.sqlite3"
+            local has_tokens=false
+            if [[ -f "$kiro_db" ]] && command -v python3 &>/dev/null; then
+                has_tokens=$(python3 -c "
+import sqlite3, sys
+try:
+    c = sqlite3.connect('$kiro_db')
+    r = c.execute(\"SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'\").fetchone()
+    print('true' if r and r[0] > 0 else 'false')
+except: print('false')
+" 2>/dev/null)
+            fi
+
+            if [[ "$has_tokens" != "true" ]]; then
+                echo ""
+                echo "  ╭─────────────────────────────────────────────────╮"
+                echo "  │  First-time setup: Kiro login required (once)   │"
+                echo "  │  kirocc auto-refreshes tokens after this.       │"
+                echo "  ╰─────────────────────────────────────────────────╯"
+                echo ""
+                local kiro_cli
+                kiro_cli=$(command -v kiro-cli 2>/dev/null || echo "$HOME/.local/bin/kiro-cli")
+                if [[ -x "$kiro_cli" ]]; then
+                    "$kiro_cli" login
+                    # Re-check tokens
+                    if [[ -f "$kiro_db" ]] && command -v python3 &>/dev/null; then
+                        has_tokens=$(python3 -c "
+import sqlite3
+try:
+    c = sqlite3.connect('$kiro_db')
+    r = c.execute(\"SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'\").fetchone()
+    print('true' if r and r[0] > 0 else 'false')
+except: print('false')
+" 2>/dev/null)
+                    fi
+                    if [[ "$has_tokens" != "true" ]]; then
+                        echo "ERROR: Kiro auth failed. Run 'kiro-cli login' manually." >&2
+                        exit 1
+                    fi
+                    echo "  ✓ Kiro login successful — tokens will auto-refresh"
+                else
+                    echo "ERROR: kiro-cli not found. Install: curl -fsSL https://kiro.dev/install.sh | bash" >&2
+                    exit 1
+                fi
+            fi
+        fi
+
         echo "  Starting kirocc gateway on :$KIROCC_PORT..."
 
         # Map Claude Code's date-suffixed model names to Kiro model IDs.

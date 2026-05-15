@@ -285,6 +285,66 @@ function Start-KiroccGateway {
         throw "kirocc not found. Install: GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest"
     }
 
+    # kirocc reads OAuth tokens from Kiro CLI's SQLite DB (auth_kv table).
+    # Once logged in, kirocc auto-refreshes tokens — no re-login needed.
+    # KIRO_API_KEY is for kiro-cli headless (CI/CD) only, NOT for kirocc.
+    $kiroDB = Join-Path $HOME ".local/share/kiro-cli/data.sqlite3"
+    if ($IsWindows) { $kiroDB = Join-Path $env:LOCALAPPDATA "kiro-cli/data.sqlite3" }
+    $hasTokens = $false
+    if (Test-Path $kiroDB) {
+        try {
+            $pyCheck = python3 -c @"
+import sqlite3
+try:
+    c = sqlite3.connect('$($kiroDB -replace "\\","/')')
+    r = c.execute("SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'").fetchone()
+    print('true' if r and r[0] > 0 else 'false')
+except: print('false')
+"@ 2>$null
+            if ($pyCheck -eq 'true') { $hasTokens = $true }
+        } catch { }
+    }
+
+    if (-not $hasTokens) {
+        Write-Host ""
+        Write-Host "  ╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
+        Write-Host "  │  First-time setup: Kiro login required (once)   │" -ForegroundColor Cyan
+        Write-Host "  │  kirocc auto-refreshes tokens after this.       │" -ForegroundColor Cyan
+        Write-Host "  ╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
+        Write-Host ""
+        $kiroCli = Get-Command kiro-cli -ErrorAction SilentlyContinue
+        if (-not $kiroCli) {
+            $kiroCliPath = Join-Path $HOME ".local/bin/kiro-cli"
+            if (Test-Path $kiroCliPath) { $kiroCli = $kiroCliPath }
+        } else { $kiroCli = $kiroCli.Source }
+
+        if ($kiroCli -and (Test-Path $kiroCli)) {
+            # Temporarily unset KIRO_API_KEY — it blocks the OAuth browser flow
+            $savedKiroKey = $env:KIRO_API_KEY
+            Remove-Item Env:KIRO_API_KEY -ErrorAction SilentlyContinue
+            & $kiroCli login
+            if ($savedKiroKey) { $env:KIRO_API_KEY = $savedKiroKey }
+            # Re-check tokens
+            try {
+                $pyCheck = python3 -c @"
+import sqlite3
+try:
+    c = sqlite3.connect('$($kiroDB -replace "\\","/')')
+    r = c.execute("SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'").fetchone()
+    print('true' if r and r[0] > 0 else 'false')
+except: print('false')
+"@ 2>$null
+                if ($pyCheck -eq 'true') { $hasTokens = $true }
+            } catch { }
+            if (-not $hasTokens) {
+                throw "Kiro auth failed. Run 'kiro-cli login' manually."
+            }
+            Write-Host "  ✓ Kiro login successful — tokens will auto-refresh" -ForegroundColor Green
+        } else {
+            throw "kiro-cli not found. Install: curl -fsSL https://kiro.dev/install.sh | bash"
+        }
+    }
+
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
     # Map Claude Code's date-suffixed model names to Kiro model IDs
