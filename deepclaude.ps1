@@ -9,6 +9,7 @@
     deepclaude --backend nv         # Nvidia NIM (kimi-k2.6)
     deepclaude --backend kimi       # Kimi Code (subscription)
     deepclaude --backend dw         # Doubleword AI
+    deepclaude --backend kiro       # Kiro (AWS Claude, via kirocc)
     deepclaude --backend anthropic  # Normal Claude Code
     deepclaude --remote             # Remote control + default backend
     deepclaude --status             # Show keys and backends
@@ -75,11 +76,16 @@ $KimiKey = if ($env:KIMI_API_KEY) { $env:KIMI_API_KEY } else {
 $DoublewordKey = if ($env:DOUBLEWORD_API_KEY) { $env:DOUBLEWORD_API_KEY } else {
     [Environment]::GetEnvironmentVariable("DOUBLEWORD_API_KEY", "User")
 }
+$KiroKey = if ($env:KIRO_API_KEY) { $env:KIRO_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("KIRO_API_KEY", "User")
+}
 
 $NvidiaModel = if ($env:NVIDIA_MODEL) { $env:NVIDIA_MODEL } else { "moonshotai/kimi-k2.6" }
 $KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
 $DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
 $DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
+$KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.5" }
+$KiroccPort = 3456
 
 $Providers = @{
     ds = @{
@@ -126,6 +132,13 @@ $Providers = @{
         opus = $DoublewordModel; sonnet = $DoublewordModel
         haiku = $DoublewordModel; subagent = $DoublewordModel
     }
+    kiro = @{
+        name = "Kiro (AWS Claude)"; needsProxy = $false; needsKirocc = $true
+        url = "http://127.0.0.1:$KiroccPort"
+        key = "dummy"; keyName = "KIRO_API_KEY"
+        opus = $KiroModel; sonnet = $KiroModel
+        haiku = "claude-haiku-4.5"; subagent = "claude-haiku-4.5"
+    }
 }
 
 function Get-KeyDisplay($k) {
@@ -144,6 +157,9 @@ if ($Status) {
     Write-Host "    NVIDIA_API_KEY:      $(Get-KeyDisplay $NvidiaKey)"
     Write-Host "    KIMI_API_KEY:        $(Get-KeyDisplay $KimiKey)"
     Write-Host "    DOUBLEWORD_API_KEY:  $(Get-KeyDisplay $DoublewordKey)"
+    Write-Host "    KIRO_API_KEY:        $(Get-KeyDisplay $KiroKey)"
+    $kiroccPath = Get-Command kirocc -ErrorAction SilentlyContinue
+    Write-Host "    kirocc:              $(if ($kiroccPath) { 'installed' } else { 'NOT FOUND' })"
     Write-Host "`n  Backends:" -ForegroundColor Yellow
     Write-Host "    deepclaude              # DeepSeek V4 Pro (default)"
     Write-Host "    deepclaude -b or        # OpenRouter (cheapest)"
@@ -151,6 +167,7 @@ if ($Status) {
     Write-Host "    deepclaude -b nv        # Nvidia NIM (kimi-k2.6)"
     Write-Host "    deepclaude -b kimi      # Kimi Code (subscription)"
     Write-Host "    deepclaude -b dw        # Doubleword AI"
+    Write-Host "    deepclaude -b kiro      # Kiro (AWS Claude, via kirocc)"
     Write-Host "    deepclaude -b anthropic # Normal Claude Code"
     Write-Host ""
     exit 0
@@ -169,6 +186,7 @@ if ($Cost) {
     Write-Host "  Nvidia NIM      `$0.44      `$0.87      OpenAI-compat"
     Write-Host "  Kimi Code       subscription         Anthropic-native"
     Write-Host "  Doubleword      `$0.44      `$0.87      OpenAI-compat"
+    Write-Host "  Kiro            subscription         AWS Claude (kirocc)"
     Write-Host "  Anthropic       `$3.00      `$15.00     Official"
     Write-Host ""
     exit 0
@@ -180,7 +198,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: deepclaude [-b backend] [--status] [--cost] [--benchmark]"
     Write-Host ""
-    Write-Host "  -b, --backend   ds (default), or, fw, nv, kimi, dw, anthropic"
+    Write-Host "  -b, --backend   ds (default), or, fw, nv, kimi, dw, kiro, anthropic"
     Write-Host "  --status        Show keys and backends"
     Write-Host "  --cost          Pricing comparison"
     Write-Host "  --benchmark     Latency test"
@@ -249,6 +267,50 @@ function Start-TranslationProxy {
     return @{ Port = ($proxyPort -replace '[^0-9]',''); Proc = $proxyProc }
 }
 
+# ── Helper: Start kirocc gateway for Kiro backend ──
+function Start-KiroccGateway {
+    # Find kirocc binary
+    $kiroccBin = Get-Command kirocc -ErrorAction SilentlyContinue
+    if (-not $kiroccBin) {
+        $homeBin = Join-Path $HOME ".local/bin/kirocc"
+        if (Test-Path $homeBin) { $kiroccBin = $homeBin }
+        else {
+            $goBin = Join-Path $HOME "go/bin/kirocc.exe"
+            if (Test-Path $goBin) { $kiroccBin = $goBin }
+        }
+    } else {
+        $kiroccBin = $kiroccBin.Source
+    }
+    if (-not $kiroccBin -or -not (Test-Path $kiroccBin)) {
+        throw "kirocc not found. Install: GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest"
+    }
+
+    Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
+    $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
+        -PassThru -WindowStyle Hidden
+
+    # Wait for readiness
+    $tries = 0
+    while ($tries -lt 30) {
+        Start-Sleep -Milliseconds 300
+        $tries++
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 2
+            break
+        } catch { }
+    }
+
+    try {
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 2
+    } catch {
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+        throw "kirocc failed to start on port $KiroccPort"
+    }
+
+    Write-Host "  kirocc ready -> Kiro (AWS Claude)" -ForegroundColor Green
+    return $proc
+}
+
 # --- Remote ---
 if ($Remote) {
     if ($Backend -eq "anthropic") {
@@ -264,8 +326,30 @@ if ($Remote) {
     }
 
     $p = $Providers[$Backend]
-    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'" -ForegroundColor Red; exit 1 }
-    if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
+    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" -ForegroundColor Red; exit 1 }
+    if (-not $p.needsKirocc -and -not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
+
+    # Kiro backend in remote mode
+    if ($p.needsKirocc) {
+        try {
+            $kiroccProc = Start-KiroccGateway
+        } catch {
+            Write-Host "ERROR: $_" -ForegroundColor Red; exit 1
+        }
+        Write-Host "  Launching remote control via Kiro...`n" -ForegroundColor Cyan
+        $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$KiroccPort"
+        Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+        Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+        try {
+            & claude remote-control @Args
+        } finally {
+            if ($kiroccProc -and -not $kiroccProc.HasExited) {
+                Stop-Process -Id $kiroccProc.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "  kirocc stopped." -ForegroundColor DarkGray
+            }
+        }
+        exit 0
+    }
 
     Write-Host "`n  Starting model proxy for $($p.name)..." -ForegroundColor Cyan
 
@@ -327,16 +411,26 @@ if ($Backend -eq "anthropic") {
 }
 
 $p = $Providers[$Backend]
-if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, anthropic" -ForegroundColor Red; exit 1 }
-if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
+if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" -ForegroundColor Red; exit 1 }
+if (-not $p.needsKirocc -and -not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
 Write-Host "`n  Launching Claude Code via $($p.name)..." -ForegroundColor Cyan
 Write-Host "  Endpoint: $($p.url)" -ForegroundColor DarkGray
 Write-Host "  Model: $($p.opus) (main) + $($p.haiku) (subagents)" -ForegroundColor DarkGray
 Write-Host ""
 
+# Kiro backend: start kirocc gateway
+if ($p.needsKirocc) {
+    try {
+        $kiroccProc = Start-KiroccGateway
+    } catch {
+        Write-Host "ERROR: $_" -ForegroundColor Red; exit 1
+    }
+    $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$KiroccPort"
+    $env:ANTHROPIC_AUTH_TOKEN = "kiro-managed"
+}
 # OpenAI-compat backends need the translation proxy
-if ($p.needsProxy) {
+elseif ($p.needsProxy) {
     Write-Host "  Starting translation proxy..." -ForegroundColor DarkGray
     try {
         $proxy = Start-TranslationProxy -Provider $p
@@ -362,6 +456,10 @@ Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 try {
     & claude @Args
 } finally {
+    if ($kiroccProc -and -not $kiroccProc.HasExited) {
+        Stop-Process -Id $kiroccProc.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "  kirocc stopped." -ForegroundColor DarkGray
+    }
     if ($proxy -and $proxy.Proc -and -not $proxy.Proc.HasExited) {
         Stop-Process -Id $proxy.Proc.Id -Force -ErrorAction SilentlyContinue
         Write-Host "  Proxy stopped." -ForegroundColor DarkGray
