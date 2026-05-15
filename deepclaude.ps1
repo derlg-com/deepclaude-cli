@@ -84,7 +84,7 @@ $NvidiaModel = if ($env:NVIDIA_MODEL) { $env:NVIDIA_MODEL } else { "moonshotai/k
 $KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
 $DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
 $DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
-$KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.5" }
+$KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.6" }
 $KiroccPort = 3456
 
 $Providers = @{
@@ -286,6 +286,10 @@ function Start-KiroccGateway {
     }
 
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
+
+    # Map Claude Code's date-suffixed model names to Kiro model IDs
+    $env:KIROCC_MODEL_MAPPINGS = '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]'
+
     $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
         -PassThru -WindowStyle Hidden
 

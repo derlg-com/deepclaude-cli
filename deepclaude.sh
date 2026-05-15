@@ -121,7 +121,7 @@ resolve_backend() {
             # Model names must use dot notation without date suffixes
             url="http://127.0.0.1:$KIROCC_PORT"
             key="dummy"  # kirocc ignores this unless -api-key is set
-            opus="${KIRO_MODEL:-claude-sonnet-4.5}"; sonnet="${KIRO_MODEL:-claude-sonnet-4.5}"
+            opus="${KIRO_MODEL:-claude-sonnet-4.6}"; sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
             haiku="${KIRO_MODEL:-claude-haiku-4.5}"; subagent="${KIRO_MODEL:-claude-haiku-4.5}"
             ;;
         anthropic) ;;
@@ -336,6 +336,18 @@ launch_claude() {
         fi
 
         echo "  Starting kirocc gateway on :$KIROCC_PORT..."
+
+        # Map Claude Code's date-suffixed model names to Kiro model IDs.
+        # Claude Code sends e.g. "claude-sonnet-4-6-20250514" but Kiro only
+        # recognizes base names like "claude-sonnet-4.6".
+        export KIROCC_MODEL_MAPPINGS='[
+          {"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},
+          {"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},
+          {"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},
+          {"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},
+          {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}
+        ]'
+
         "$kirocc_bin" -port "$KIROCC_PORT" > /dev/null 2>&1 &
         PROXY_PID=$!
 
