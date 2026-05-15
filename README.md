@@ -1,69 +1,39 @@
-# Welcome to Poor Developer
-
-## How to start it: 
-```
-Step 1: create the new .env into the proxy folder
-step 2: copy the format from the .env.exaple into your real .env that you just create it. 
-step 3: install claude code from official website is not yet install
-step 4: input the api into the .env
-step 5: we build for many opteration so please read this carefully 
-- If you use window just run this file: deepclaude.ps1
-- If you use linux just run this file: deepclaude.sh
-
-```
-
-# NOTE: 
-### If you have any issue and the instruction can't help. last choice ask AI for help! 
-
 # deepclaude
 
-Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **OpenRouter**, or any Anthropic-compatible backend. Same UX, 17x cheaper.
+Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **Kiro**, **Nvidia NIM**, **Kimi Code**, **Doubleword AI**, or any Anthropic-compatible backend. Same UX, up to 17× cheaper — or even **free with a subscription**.
 
 ![Remote control running DeepSeek V4 Pro in the browser](screenshots/remote-control-deepseek.png)
 
 ## What this does
 
-Claude Code is the best autonomous coding agent — but it costs $200/month with usage caps. DeepSeek V4 Pro scores 96.4% on LiveCodeBench and costs $0.87/M output tokens.
-
-**deepclaude** swaps the brain while keeping the body:
+Claude Code is the best autonomous coding agent — but it costs $200/month with usage caps. **deepclaude** swaps the brain while keeping the body:
 
 ```
 Your terminal
-  +-- Claude Code CLI (tool loop, file editing, bash, git - unchanged)
-        +-- API calls -> DeepSeek V4 Pro ($0.87/M) instead of Anthropic ($15/M)
+  +-- Claude Code CLI (tool loop, file editing, bash, git — unchanged)
+        +-- API calls -> Your chosen backend instead of Anthropic
 ```
 
 Everything works: file reading, editing, bash execution, subagent spawning, autonomous multi-step coding loops. The only difference is which model thinks.
 
+---
+
 ## Quick start (2 minutes)
 
-### 1. Get a DeepSeek API key
+### 1. Get an API key
 
-Sign up at [platform.deepseek.com](https://platform.deepseek.com), add $5 credit, copy your API key.
+Pick any backend (or multiple). See [Provider Setup](#provider-setup) below.
 
-### 2. Set environment variables
+### 2. Configure
 
-**Windows (PowerShell):**
-```powershell
-setx DEEPSEEK_API_KEY "sk-your-key-here"
-```
-
-**macOS/Linux:**
 ```bash
-echo 'export DEEPSEEK_API_KEY="sk-your-key-here"' >> ~/.bashrc
-source ~/.bashrc
+# Copy the example env file
+cp proxy/.env.example proxy/.env
+# Edit with your API keys
+nano proxy/.env
 ```
 
 ### 3. Install
-
-**Windows:**
-```powershell
-# Copy the script to a directory in your PATH
-Copy-Item deepclaude.ps1 "$env:USERPROFILE\.local\bin\deepclaude.ps1"
-
-# Or add the repo directory to PATH
-setx PATH "$env:PATH;C:\path\to\deepclaude"
-```
 
 **macOS/Linux:**
 ```bash
@@ -71,18 +41,268 @@ chmod +x deepclaude.sh
 sudo ln -s "$(pwd)/deepclaude.sh" /usr/local/bin/deepclaude
 ```
 
+**Windows (PowerShell):**
+```powershell
+Copy-Item deepclaude.ps1 "$env:USERPROFILE\.local\bin\deepclaude.ps1"
+```
+
 ### 4. Use it
 
 ```bash
-deepclaude                  # Launch Claude Code with DeepSeek V4 Pro
-deepclaude --status         # Show available backends and keys
-deepclaude --backend or     # Use OpenRouter (cheapest, $0.44/M input)
-deepclaude --backend fw     # Use Fireworks AI (fastest, US servers)
-deepclaude --backend anthropic  # Normal Claude Code (when you need Opus)
-deepclaude --cost           # Show pricing comparison
-deepclaude --benchmark      # Latency test across all providers
-deepclaude --switch ds      # Switch backend mid-session (no restart)
+deepclaude                      # Launch with default backend (DeepSeek)
+deepclaude -b kiro              # Use Kiro (AWS Claude, subscription)
+deepclaude -b nv                # Use Nvidia NIM
+deepclaude -b kimi              # Use Kimi Code
+deepclaude -b dw                # Use Doubleword AI
+deepclaude -b or                # Use OpenRouter
+deepclaude -b fw                # Use Fireworks AI
+deepclaude -b anthropic         # Normal Claude Code
+deepclaude --remote             # Remote control mode (browser URL)
+deepclaude --status             # Show all backends and key status
+deepclaude --cost               # Pricing comparison
+deepclaude --benchmark          # Latency test
 ```
+
+---
+
+## Supported backends
+
+| Backend | Flag | Input/M | Output/M | Protocol | Notes |
+|---|---|---|---|---|---|
+| **DeepSeek** (default) | `-b ds` | $0.44 | $0.87 | Anthropic-native | Auto context caching |
+| **Kiro** ⭐ | `-b kiro` | subscription | subscription | AWS (kirocc gateway) | Claude Sonnet 4.6 via Kiro Pro |
+| **OpenRouter** | `-b or` | $0.44 | $0.87 | Anthropic-native | Multi-provider routing |
+| **Fireworks AI** | `-b fw` | $1.74 | $3.48 | Anthropic-native | Lowest latency (US) |
+| **Nvidia NIM** | `-b nv` | $0.44 | $0.87 | OpenAI-compat → proxy | kimi-k2.6 default |
+| **Kimi Code** | `-b kimi` | subscription | subscription | Anthropic-native | kimi-for-coding |
+| **Doubleword AI** | `-b dw` | $0.44 | $0.87 | OpenAI-compat → proxy | DeepSeek-V4-Pro |
+| **Anthropic** | `-b anthropic` | $3.00 | $15.00 | Official | Original Claude Opus |
+
+---
+
+## Architecture
+
+deepclaude uses three different routing strategies depending on the backend type:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    deepclaude launcher                       │
+│               (deepclaude.sh / deepclaude.ps1)              │
+├─────────────┬──────────────────┬────────────────────────────┤
+│  Native     │  OpenAI-compat   │  Kiro                      │
+│  Backends   │  Backends        │  Backend                   │
+├─────────────┼──────────────────┼────────────────────────────┤
+│ DeepSeek    │ Nvidia NIM       │ Kiro (AWS Claude)          │
+│ OpenRouter  │ Doubleword AI    │                            │
+│ Fireworks   │                  │                            │
+│ Kimi Code   │                  │                            │
+├─────────────┼──────────────────┼────────────────────────────┤
+│             │  Node.js Proxy   │  kirocc Gateway            │
+│  Direct     │  (model-proxy +  │  (Go binary, translates    │
+│  Connect    │  openai-translator)│ Anthropic ↔ AWS EventStream│
+│             │  Port: dynamic   │  Port: 3456)               │
+├─────────────┼──────────────────┼────────────────────────────┤
+│ Claude Code │ Claude Code      │ Claude Code                │
+│  ↓          │  ↓               │  ↓                         │
+│ Backend API │ localhost:PORT   │ localhost:3456              │
+└─────────────┴──────────────────┴────────────────────────────┘
+```
+
+### Routing Strategy
+
+| Strategy | Backends | How it works |
+|---|---|---|
+| **Direct connect** | DeepSeek, OpenRouter, Fireworks, Kimi | Backend speaks Anthropic Messages API natively. `ANTHROPIC_BASE_URL` points directly to the backend. |
+| **Node.js proxy** | Nvidia, Doubleword | Backend speaks OpenAI Chat Completions API. A local Node.js proxy translates Anthropic ↔ OpenAI format in real-time. |
+| **kirocc gateway** | Kiro | Backend uses AWS Event Stream protocol. The `kirocc` Go binary translates Anthropic Messages API ↔ Kiro's internal AWS protocol. |
+
+---
+
+## Provider Setup
+
+### DeepSeek (default)
+
+**Type:** Anthropic-native (direct connect)  
+**Cost:** $0.44/M input, $0.87/M output  
+**Model:** `deepseek-v4-pro`
+
+```bash
+# Get key from https://platform.deepseek.com
+export DEEPSEEK_API_KEY="sk-your-key"
+deepclaude           # or: deepclaude -b ds
+```
+
+**`.env` config:**
+```ini
+DEEPSEEK_API_KEY=sk-your-key
+DEEPSEEK_MODEL=deepseek-v4-pro
+```
+
+---
+
+### Kiro (AWS Claude) ⭐
+
+**Type:** kirocc gateway (Go binary)  
+**Cost:** Subscription-based ($0 Free / $20 Pro / $40 Pro+)  
+**Models:** `claude-sonnet-4.6` (Pro), `claude-sonnet-4.5` (Free), `claude-haiku-4.5`, `claude-opus-4.6`
+
+Kiro provides access to Claude models through Amazon's AWS infrastructure using a subscription model instead of per-token billing.
+
+#### Prerequisites
+
+1. **Install Kiro CLI:**
+   ```bash
+   # Download from https://kiro.dev/downloads/
+   # Or install via package manager
+   ```
+
+2. **Login to Kiro CLI:**
+   ```bash
+   kiro-cli login
+   # Opens browser for authentication (GitHub, Google, or AWS Builder ID)
+   ```
+
+3. **Install kirocc gateway:**
+   ```bash
+   # Requires Go 1.24+
+   GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest
+   ```
+
+4. **Upgrade to Pro (for Sonnet 4.6):**
+   - Visit [app.kiro.dev](https://app.kiro.dev) and upgrade to Pro ($20/mo)
+   - Free tier only has access to Sonnet 4.5 and Haiku 4.5
+
+#### Usage
+
+```bash
+deepclaude -b kiro              # Launch with Sonnet 4.6 (default)
+deepclaude -b kiro --remote     # Remote control mode
+```
+
+**`.env` config:**
+```ini
+KIRO_API_KEY=ksk_your-key-here
+KIRO_MODEL=claude-sonnet-4.6    # Must use dot notation!
+```
+
+#### How Kiro works internally
+
+```
+Claude Code → kirocc (:3456) → AWS Event Stream → Kiro Backend → Claude Model
+                 │
+                 ├── Reads Kiro CLI credentials from SQLite DB
+                 ├── Maps model names (claude-sonnet-4-6 → claude-sonnet-4.6)
+                 ├── Maps date-suffixed names (claude-sonnet-4-6-20250514 → claude-sonnet-4.6)
+                 └── Translates Anthropic Messages API ↔ AWS CodeWhisperer protocol
+```
+
+#### Kiro model availability by plan
+
+| Plan | Models | Credits/month |
+|---|---|---|
+| Free ($0) | Sonnet 4.5, Haiku 4.5 | 50 |
+| Pro ($20) | + Sonnet 4.6, Opus 4.6 | 1,000 |
+| Pro+ ($40) | + Sonnet 4.6, Opus 4.6 | 2,000 |
+| Power ($200) | + Sonnet 4.6, Opus 4.6, Opus 4.7 | 10,000 |
+
+#### Troubleshooting Kiro
+
+- **"Invalid model ID"**: Your plan doesn't have access to that model. Check with `deepclaude --status` or upgrade at [app.kiro.dev](https://app.kiro.dev).
+- **"kirocc not found"**: Install with `GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest`
+- **Auth errors**: Run `kiro-cli logout && kiro-cli login` to refresh credentials.
+- **Model names**: Always use **dot notation** (e.g., `claude-sonnet-4.6`) in `.env`, NOT dashes.
+
+---
+
+### Nvidia NIM
+
+**Type:** OpenAI-compatible (via Node.js proxy)  
+**Cost:** $0.44/M input, $0.87/M output  
+**Model:** `moonshotai/kimi-k2.6`
+
+```bash
+# Get key from https://build.nvidia.com
+export NVIDIA_API_KEY="nvapi-your-key"
+deepclaude -b nv
+```
+
+**`.env` config:**
+```ini
+NVIDIA_API_KEY=nvapi-your-key
+NVIDIA_MODEL=moonshotai/kimi-k2.6
+```
+
+---
+
+### Kimi Code
+
+**Type:** Anthropic-native (direct connect)  
+**Cost:** Subscription-based  
+**Model:** `kimi-for-coding`
+
+```bash
+# Get key from https://kimi.com
+export KIMI_API_KEY="sk-your-key"
+deepclaude -b kimi
+```
+
+**`.env` config:**
+```ini
+KIMI_API_KEY=sk-your-key
+KIMI_MODEL=kimi-for-coding
+```
+
+---
+
+### Doubleword AI
+
+**Type:** OpenAI-compatible (via Node.js proxy)  
+**Cost:** $0.44/M input, $0.87/M output  
+**Model:** `deepseek-ai/DeepSeek-V4-Pro`
+
+```bash
+# Get key from https://doubleword.ai
+export DOUBLEWORD_API_KEY="sk-your-key"
+deepclaude -b dw
+```
+
+**`.env` config:**
+```ini
+DOUBLEWORD_API_KEY=sk-your-key
+DOUBLEWORD_MODEL=deepseek-ai/DeepSeek-V4-Pro
+```
+
+**Docs:** [docs.doubleword.ai/inference-api/tool-calling](https://docs.doubleword.ai/inference-api/tool-calling)
+
+---
+
+### OpenRouter
+
+**Type:** Anthropic-native (direct connect)  
+**Cost:** $0.44/M input, $0.87/M output  
+**Model:** `deepseek/deepseek-v4-pro`
+
+```bash
+# Get key from https://openrouter.ai
+export OPENROUTER_API_KEY="sk-or-your-key"
+deepclaude -b or
+```
+
+---
+
+### Fireworks AI
+
+**Type:** Anthropic-native (direct connect)  
+**Cost:** $1.74/M input, $3.48/M output  
+**Model:** `accounts/fireworks/models/deepseek-v4-pro`
+
+```bash
+# Get key from https://fireworks.ai
+export FIREWORKS_API_KEY="fw_your-key"
+deepclaude -b fw
+```
+
+---
 
 ## How it works
 
@@ -99,99 +319,34 @@ Claude Code reads these environment variables to determine where to send API cal
 
 **deepclaude** sets these per-session (not permanently), launches Claude Code, then restores your original settings on exit.
 
-## Supported backends
+---
 
-| Backend | Flag | Input/M | Output/M | Servers | Notes |
-|---|---|---|---|---|---|
-| **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
-| **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
-| **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
-| **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
+## Remote control (`--remote`)
 
-### Setup per backend
+Open a Claude Code session in any browser — with your chosen backend as the brain:
 
-**DeepSeek** (default - just needs `DEEPSEEK_API_KEY`):
 ```bash
-setx DEEPSEEK_API_KEY "sk-..."           # Windows
-export DEEPSEEK_API_KEY="sk-..."         # macOS/Linux
+deepclaude --remote                # Remote control + DeepSeek
+deepclaude --remote -b kiro        # Remote control + Kiro (AWS Claude)
+deepclaude --remote -b or          # Remote control + OpenRouter
+deepclaude --remote -b anthropic   # Remote control + Anthropic (normal)
 ```
 
-**OpenRouter** (optional):
-```bash
-setx OPENROUTER_API_KEY "sk-or-..."      # Windows
-export OPENROUTER_API_KEY="sk-or-..."    # macOS/Linux
+This prints a `https://claude.ai/code/session_...` URL you can open on your phone, tablet, or any browser.
+
+```
+claude remote-control
+  +-- Bridge WebSocket -> wss://bridge.claudeusercontent.com (Anthropic)
+  +-- Model API calls  -> Your chosen backend
 ```
 
-**Fireworks AI** (optional):
-```bash
-setx FIREWORKS_API_KEY "fw_..."          # Windows
-export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
-```
+**Prerequisites:** Must be logged into Claude Code (`claude auth login`) and have a claude.ai subscription.
 
-## Cost comparison
-
-| Usage level | Anthropic Max | deepclaude (DeepSeek) | Savings |
-|---|---|---|---|
-| Light (10 days/mo) | $200/mo (capped) | ~$20/mo | 90% |
-| Heavy (25 days/mo) | $200/mo (capped) | ~$50/mo | 75% |
-| With auto loops | $200/mo (capped) | ~$80/mo | 60% |
-
-DeepSeek's automatic context caching makes agent loops extremely cheap - after the first request, the system prompt and file context are cached at $0.004/M (vs $0.44/M uncached).
-
-## What works and what doesn't
-
-### Works
-- File reading, writing, editing (Read/Write/Edit tools)
-- Bash/PowerShell execution
-- Glob and Grep search
-- Multi-step autonomous tool loops
-- Subagent spawning
-- Git operations
-- Project initialization (`/init`)
-- Thinking mode (enabled by default)
-
-### Doesn't work or degraded
-| Feature | Reason |
-|---|---|
-| Image/vision input | DeepSeek's Anthropic endpoint doesn't support images |
-| Parallel tool use | Supported by DeepSeek (up to 128 per call), but Claude Code sends tools sequentially by default |
-| MCP server tools | Not supported through compatibility layer |
-| Prompt caching savings | DeepSeek has its own caching (automatic), but Anthropic's `cache_control` is ignored |
-
-### Intelligence difference
-- **Routine tasks** (80% of work): DeepSeek V4 Pro is comparable to Claude Opus
-- **Complex reasoning** (20%): Claude Opus is stronger - switch with `--backend anthropic`
+---
 
 ## Live switching (no restart)
 
-Switch between Anthropic and DeepSeek **mid-session** - from inside Claude Code itself. No restart, no terminal commands. Just type a slash command.
-
-**In Claude Code terminal:**
-
-![/deepseek in Claude Code CLI](screenshots/terminal%20for%20terminal%20embed2.PNG)
-
-**In Claude Code VS Code extension:**
-
-![/deepseek in VS Code extension](screenshots/terminal%20for%20vscode%20embed2.PNG)
-
-### How it works
-
-The proxy runs on `localhost:3200` and intercepts all API calls. A control endpoint (`/_proxy/mode`) lets you switch the active backend instantly:
-
-```
-Claude Code -> localhost:3200 (proxy)
-                 |
-                 +-- /_proxy/mode POST -> switch backend
-                 +-- /_proxy/status GET -> current backend + uptime
-                 +-- /_proxy/cost GET -> token usage + cost savings
-                 |
-                 +-- /v1/messages -> active backend (DeepSeek/OpenRouter/Anthropic)
-                 +-- everything else -> Anthropic (passthrough)
-```
-
-### Option 1: Slash commands (recommended)
-
-Add these files to `~/.claude/commands/`:
+Switch between backends **mid-session** from inside Claude Code. Add these files to `~/.claude/commands/`:
 
 **`deepseek.md`:**
 ```
@@ -207,88 +362,106 @@ curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=anthropic"
 If successful, say: "Switched to Anthropic."
 ```
 
-**`openrouter.md`:**
+Then type `/deepseek` or `/anthropic` in any Claude Code session.
+
+---
+
+## Cost comparison
+
+| Usage level | Anthropic Max | deepclaude (DeepSeek) | Kiro Pro | Savings |
+|---|---|---|---|---|
+| Light (10 days/mo) | $200/mo (capped) | ~$20/mo | $20/mo | 90% |
+| Heavy (25 days/mo) | $200/mo (capped) | ~$50/mo | $20/mo | 75-90% |
+| With auto loops | $200/mo (capped) | ~$80/mo | $20-40/mo | 60-90% |
+
+---
+
+## Project structure
+
 ```
-Switch the model proxy to OpenRouter. Run this command silently and report the result:
-curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=openrouter"
-If successful, say: "Switched to OpenRouter."
-```
-
-Then type `/deepseek`, `/anthropic`, or `/openrouter` in any Claude Code session to switch instantly.
-
-### Option 2: CLI flag
-
-```bash
-deepclaude --switch deepseek    # or: ds, or, fw, anthropic
-deepclaude -s anthropic
-```
-
-### Option 3: VS Code keyboard shortcuts
-
-Add to `.vscode/tasks.json`:
-```json
-{
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "Proxy: Switch to DeepSeek",
-      "type": "shell",
-      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=deepseek'",
-      "presentation": { "reveal": "always" },
-      "problemMatcher": []
-    },
-    {
-      "label": "Proxy: Switch to Anthropic",
-      "type": "shell",
-      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=anthropic'",
-      "presentation": { "reveal": "always" },
-      "problemMatcher": []
-    }
-  ]
-}
+deepclaude-cli/
+├── deepclaude.sh          # Main launcher (Linux/macOS)
+├── deepclaude.ps1         # Main launcher (Windows)
+├── proxy/
+│   ├── .env               # API keys and configuration
+│   ├── .env.example       # Template for .env
+│   ├── model-proxy.js     # HTTP proxy server (Anthropic ↔ backend)
+│   ├── openai-translator.js  # Anthropic ↔ OpenAI format translator
+│   ├── start-proxy.js     # Proxy entry point
+│   └── README.md          # Proxy technical details
+├── screenshots/           # Documentation images
+└── README.md              # This file
 ```
 
-Then bind in `keybindings.json`:
-```json
-{ "key": "ctrl+alt+d", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to DeepSeek" },
-{ "key": "ctrl+alt+a", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to Anthropic" }
-```
+### Key files explained
 
-### Cost tracking
+| File | Purpose |
+|---|---|
+| `deepclaude.sh` | Bash launcher. Resolves backend, starts proxy/kirocc if needed, sets env vars, launches `claude`. |
+| `deepclaude.ps1` | PowerShell equivalent for Windows. Same logic, different syntax. |
+| `model-proxy.js` | HTTP server that routes `/v1/messages` to the active backend. Handles live switching, cost tracking. |
+| `openai-translator.js` | Streaming translator between Anthropic Messages API and OpenAI Chat Completions API. Used by Nvidia and Doubleword backends. |
+| `start-proxy.js` | Starts the proxy server with the given backend URL and key. Outputs the port number for the shell script. |
 
-The proxy tracks token usage and calculates savings vs Anthropic pricing:
+---
 
-```bash
-curl -s http://127.0.0.1:3200/_proxy/cost
-```
+## What works and what doesn't
 
-Returns:
-```json
-{
-  "backends": {
-    "deepseek": {
-      "input_tokens": 125000,
-      "output_tokens": 45000,
-      "requests": 12,
-      "cost": 0.0941,
-      "anthropic_equivalent": 1.05
-    }
-  },
-  "total_cost": 0.0941,
-  "anthropic_equivalent": 1.05,
-  "savings": 0.9559
-}
-```
+### Works
+- File reading, writing, editing (Read/Write/Edit tools)
+- Bash/PowerShell execution
+- Glob and Grep search
+- Multi-step autonomous tool loops
+- Subagent spawning
+- Git operations
+- Project initialization (`/init`)
+- Thinking mode (enabled by default)
+
+### Doesn't work or degraded
+
+| Feature | Reason |
+|---|---|
+| Image/vision input | DeepSeek/Kimi endpoints don't support images |
+| MCP server tools | Not all backends support MCP |
+| Prompt caching savings | Each backend has its own caching; Anthropic's `cache_control` is ignored |
+
+---
+
+## Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | For DeepSeek | API key from platform.deepseek.com |
+| `OPENROUTER_API_KEY` | For OpenRouter | API key from openrouter.ai |
+| `FIREWORKS_API_KEY` | For Fireworks | API key from fireworks.ai |
+| `NVIDIA_API_KEY` | For Nvidia | API key from build.nvidia.com |
+| `KIMI_API_KEY` | For Kimi | API key from kimi.com |
+| `DOUBLEWORD_API_KEY` | For Doubleword | API key from doubleword.ai |
+| `KIRO_API_KEY` | For Kiro | API key (ksk_ prefix) from kiro.dev |
+| `API_PROVIDER` | No | Default backend (ds, or, fw, nv, kimi, dw, kiro) |
+
+---
 
 ## VS Code / Cursor integration
 
-Add terminal profiles so you can launch deepclaude from the IDE:
+Add terminal profiles to launch deepclaude from the IDE:
 
-**Settings > JSON:**
+**Linux/macOS:**
+```json
+{
+  "terminal.integrated.profiles.linux": {
+    "DeepClaude Agent": {
+      "path": "/usr/local/bin/deepclaude"
+    }
+  }
+}
+```
+
+**Windows:**
 ```json
 {
   "terminal.integrated.profiles.windows": {
-    "DeepSeek Agent": {
+    "DeepClaude Agent": {
       "path": "powershell.exe",
       "args": ["-ExecutionPolicy", "Bypass", "-NoExit", "-File", "C:\\path\\to\\deepclaude.ps1"]
     }
@@ -296,47 +469,7 @@ Add terminal profiles so you can launch deepclaude from the IDE:
 }
 ```
 
-Or on macOS/Linux:
-```json
-{
-  "terminal.integrated.profiles.linux": {
-    "DeepSeek Agent": {
-      "path": "/usr/local/bin/deepclaude"
-    }
-  }
-}
-```
-
-## Remote control (`--remote`)
-
-Open a Claude Code session in any browser - with DeepSeek as the brain:
-
-```bash
-deepclaude --remote                # Remote control + DeepSeek
-deepclaude --remote -b or          # Remote control + OpenRouter
-deepclaude --remote -b anthropic   # Remote control + Anthropic (normal)
-```
-
-This prints a `https://claude.ai/code/session_...` URL you can open on your phone, tablet, or any browser.
-
-### How it works
-
-Remote control needs Anthropic's bridge for the WebSocket connection, but model calls can go elsewhere. deepclaude starts a local proxy that splits the traffic:
-
-```
-claude remote-control
-  +-- Bridge WebSocket -> wss://bridge.claudeusercontent.com (Anthropic, hardcoded)
-  +-- Model API calls  -> http://localhost:3200 (proxy)
-                            +-- /v1/messages -> DeepSeek ($0.87/M)
-                            +-- everything else -> Anthropic (passthrough)
-```
-
-### Prerequisites
-- Must be logged into Claude Code: `claude auth login`
-- Must have a claude.ai subscription (the bridge is Anthropic infrastructure)
-- Node.js 18+ (for the proxy)
-
-The proxy starts automatically and stops when the session ends. See [proxy/README.md](proxy/README.md) for technical details.
+---
 
 ## License
 
