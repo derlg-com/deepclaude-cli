@@ -285,46 +285,18 @@ function Start-KiroccGateway {
         throw "kirocc not found. Install: GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest"
     }
 
-    # kirocc reads OAuth tokens from Kiro CLI's SQLite DB (auth_kv table).
-    # Once logged in, kirocc auto-refreshes tokens — no re-login needed.
-    # KIRO_API_KEY is for kiro-cli headless (CI/CD) only, NOT for kirocc.
-    $kiroDB = Join-Path $HOME ".local/share/kiro-cli/data.sqlite3"
-    if ($IsWindows) { $kiroDB = Join-Path $env:LOCALAPPDATA "kiro-cli/data.sqlite3" }
-    $hasTokens = $false
-    if (Test-Path $kiroDB) {
-        try {
-            $pyCheck = python3 -c @"
-import sqlite3
-try:
-    c = sqlite3.connect('$($kiroDB -replace "\\","/')')
-    r = c.execute("SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'").fetchone()
-    print('true' if r and r[0] > 0 else 'false')
-except: print('false')
-"@ 2>$null
-            if ($pyCheck -eq 'true') { $hasTokens = $true }
-        } catch { }
-    }
-
-    if (-not $hasTokens) {
-        Write-Host ""
-        Write-Host "  ╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
-        Write-Host "  │  First-time setup: Kiro login required (once)   │" -ForegroundColor Cyan
-        Write-Host "  │  kirocc auto-refreshes tokens after this.       │" -ForegroundColor Cyan
-        Write-Host "  ╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
-        Write-Host ""
-        $kiroCli = Get-Command kiro-cli -ErrorAction SilentlyContinue
-        if (-not $kiroCli) {
-            $kiroCliPath = Join-Path $HOME ".local/bin/kiro-cli"
-            if (Test-Path $kiroCliPath) { $kiroCli = $kiroCliPath }
-        } else { $kiroCli = $kiroCli.Source }
-
-        if ($kiroCli -and (Test-Path $kiroCli)) {
-            # Temporarily unset KIRO_API_KEY — it blocks the OAuth browser flow
-            $savedKiroKey = $env:KIRO_API_KEY
-            Remove-Item Env:KIRO_API_KEY -ErrorAction SilentlyContinue
-            & $kiroCli login
-            if ($savedKiroKey) { $env:KIRO_API_KEY = $savedKiroKey }
-            # Re-check tokens
+    # Auth mode: KIRO_API_KEY (ksk_...) bypasses OAuth/SQLite entirely.
+    # kirocc uses the key directly as a Bearer token + sends "TokenType: API_KEY"
+    # header so the Kiro backend routes it through API key validation, not OAuth.
+    if ($KiroKey) {
+        Write-Host "  Using KIRO_API_KEY for authentication (no OAuth required)" -ForegroundColor DarkGray
+        # kirocc reads KIRO_API_KEY from the environment automatically — nothing else needed.
+    } else {
+        # Fall back to kiro-cli SQLite OAuth tokens.
+        $kiroDB = Join-Path $HOME ".local/share/kiro-cli/data.sqlite3"
+        if ($IsWindows) { $kiroDB = Join-Path $env:LOCALAPPDATA "kiro-cli/data.sqlite3" }
+        $hasTokens = $false
+        if (Test-Path $kiroDB) {
             try {
                 $pyCheck = python3 -c @"
 import sqlite3
@@ -336,36 +308,84 @@ except: print('false')
 "@ 2>$null
                 if ($pyCheck -eq 'true') { $hasTokens = $true }
             } catch { }
-            if (-not $hasTokens) {
-                throw "Kiro auth failed. Run 'kiro-cli login' manually."
+        }
+
+        if (-not $hasTokens) {
+            Write-Host ""
+            Write-Host "  ╭─────────────────────────────────────────────────╮" -ForegroundColor Cyan
+            Write-Host "  │  First-time setup: Kiro login required (once)   │" -ForegroundColor Cyan
+            Write-Host "  │  kirocc auto-refreshes tokens after this.       │" -ForegroundColor Cyan
+            Write-Host "  ╰─────────────────────────────────────────────────╯" -ForegroundColor Cyan
+            Write-Host ""
+            $kiroCli = Get-Command kiro-cli -ErrorAction SilentlyContinue
+            if (-not $kiroCli) {
+                $kiroCliPath = Join-Path $HOME ".local/bin/kiro-cli"
+                if (Test-Path $kiroCliPath) { $kiroCli = $kiroCliPath }
+            } else { $kiroCli = $kiroCli.Source }
+
+            if ($kiroCli -and (Test-Path $kiroCli)) {
+                & $kiroCli login
+                # Re-check tokens
+                try {
+                    $pyCheck = python3 -c @"
+import sqlite3
+try:
+    c = sqlite3.connect('$($kiroDB -replace "\\","/')')
+    r = c.execute("SELECT COUNT(*) FROM auth_kv WHERE key LIKE 'kirocli:%:token'").fetchone()
+    print('true' if r and r[0] > 0 else 'false')
+except: print('false')
+"@ 2>$null
+                    if ($pyCheck -eq 'true') { $hasTokens = $true }
+                } catch { }
+                if (-not $hasTokens) {
+                    throw "Kiro auth failed. Run 'kiro-cli login' manually."
+                }
+                Write-Host "  ✓ Kiro login successful — tokens will auto-refresh" -ForegroundColor Green
+            } else {
+                throw "kiro-cli not found. Install: curl -fsSL https://kiro.dev/install.sh | bash"
             }
-            Write-Host "  ✓ Kiro login successful — tokens will auto-refresh" -ForegroundColor Green
-        } else {
-            throw "kiro-cli not found. Install: curl -fsSL https://kiro.dev/install.sh | bash"
         }
     }
 
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
-    # Map Claude Code's date-suffixed model names to Kiro model IDs
+    # Kill any stale kirocc already listening on this port.
+    # Use Stop-Process -Force (equivalent to kill -9 / SIGKILL) — NOT graceful termination.
+    # Graceful stop triggers Go's http.Server.Shutdown() which waits for active connections
+    # to drain before releasing the listen socket. Active claude sessions keep connections
+    # open indefinitely, so graceful stop leaves the port bound forever and the new
+    # kirocc (with the correct auth) can never start.
+    $stalePid = (Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue).OwningProcess
+    if ($stalePid) {
+        Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 200
+    }
+
+    # Map Claude Code's date-suffixed model names to Kiro model IDs.
+    # Claude Code appends dates internally (e.g. claude-sonnet-4-6-20250514).
+    # The Kiro backend rejects these — this table strips them before the request
+    # reaches the upstream API.
     $env:KIROCC_MODEL_MAPPINGS = '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]'
 
+    # kirocc inherits KIRO_API_KEY from the current process environment automatically.
     $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
         -PassThru -WindowStyle Hidden
 
-    # Wait for readiness
+    # Poll until kirocc is accepting connections (typically < 100ms).
+    # TimeoutSec 1 prevents Invoke-RestMethod from hanging if kirocc accepts
+    # the TCP connection but does not respond.
     $tries = 0
     while ($tries -lt 30) {
         Start-Sleep -Milliseconds 300
         $tries++
         try {
-            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 2
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
             break
         } catch { }
     }
 
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 2
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
     } catch {
         if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
         throw "kirocc failed to start on port $KiroccPort"
