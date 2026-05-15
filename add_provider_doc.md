@@ -129,19 +129,30 @@ except: print('false')
     echo "  Starting kirocc gateway on :$KIROCC_PORT..."
 
     # CRITICAL: Kill any stale kirocc already bound to this port.
-    # Use -s TCP:LISTEN to target only the server process, not connected clients
-    # (lsof without this flag returns ALL processes using the port, including
-    # claude itself, which would kill the current session).
+    # Use `ss` as the primary tool — it queries the kernel directly and never hangs.
+    # Fall back to `lsof` (with a 3s hard timeout) only if ss returns no PID.
+    # WARNING: plain `lsof -ti tcp:PORT` without `-s TCP:LISTEN` returns ALL processes
+    # using the port (server + connected clients). Without the filter, head -1 gives you
+    # the claude client PID, which kills the current session. Always filter to LISTEN state.
     # Use kill -9 (SIGKILL), NOT kill (SIGTERM): SIGTERM triggers Go's graceful
-    # http.Server.Shutdown(), which waits for active connections to drain before
-    # releasing the listen socket. Active claude sessions never close their
-    # connections, so SIGTERM leaves the port bound forever. SIGKILL releases
-    # the socket immediately.
+    # http.Server.Shutdown(), which waits for active connections to drain.
+    # Active claude sessions keep connections open indefinitely, so SIGTERM leaves the
+    # port bound forever. SIGKILL releases the socket immediately.
     local stale_pid
-    stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null)
+    stale_pid=$(ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null \
+        | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
+    if [[ -z "$stale_pid" ]]; then
+        stale_pid=$(timeout 3 lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null || true)
+    fi
     if [[ -n "$stale_pid" ]]; then
         kill -9 "$stale_pid" 2>/dev/null || true
-        sleep 0.2
+        # Wait until the port is actually free (max 2s), not just a fixed sleep.
+        local wait_n=0
+        while timeout 1 ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null | grep -q LISTEN \
+              && [[ $wait_n -lt 20 ]]; do
+            sleep 0.1
+            wait_n=$((wait_n + 1))
+        done
     fi
 
     # CRITICAL: Claude Code appends date suffixes to model IDs
@@ -156,23 +167,35 @@ except: print('false')
       {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}
     ]'
 
+    # Log kirocc output to a temp file so the error is visible if startup fails.
+    local kirocc_log
+    kirocc_log=$(mktemp /tmp/kirocc-XXXXXX.log)
+
     # Start kirocc. It inherits KIRO_API_KEY from the environment automatically.
-    "$kirocc_bin" -port "$KIROCC_PORT" > /dev/null 2>&1 &
+    "$kirocc_bin" -port "$KIROCC_PORT" > "$kirocc_log" 2>&1 &
     PROXY_PID=$!
 
-    # Poll until kirocc is accepting connections.
-    # --max-time 1 prevents curl from hanging if kirocc is up but not responding.
+    # Poll until kirocc is accepting connections (max ~9s).
+    # --max-time 1 prevents curl from hanging if kirocc accepts the TCP connection
+    # but does not respond. Dots give the user visible progress.
     local tries=0
     while ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 \
           && [[ $tries -lt 30 ]]; do
         sleep 0.3
         tries=$((tries + 1))
+        if (( tries % 3 == 0 )); then printf '.'; fi
     done
+    echo ""
 
     if ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
         echo "ERROR: kirocc failed to start on port $KIROCC_PORT" >&2
+        echo "--- kirocc log ---" >&2
+        cat "$kirocc_log" >&2
+        echo "------------------" >&2
+        rm -f "$kirocc_log"
         exit 1
     fi
+    rm -f "$kirocc_log"
 
     echo "  kirocc ready → Kiro (AWS Claude)"
 fi
@@ -211,16 +234,55 @@ function Start-KiroccGateway {
     $kiroccBin = Get-Command kirocc -ErrorAction SilentlyContinue
     if (-not $kiroccBin) { $kiroccBin = Join-Path $HOME "go/bin/kirocc.exe" }
 
-    $env:KIROCC_MODEL_MAPPINGS = '[
-      {"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},
-      {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}
-    ]'
+    $env:KIROCC_MODEL_MAPPINGS = '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]'
 
-    # Kill any stale listener on the port before starting fresh
+    # Kill stale listener and wait until the port is actually free (max 2s).
+    # Stop-Process -Force = SIGKILL equivalent (skips graceful Go shutdown).
     $stalePid = (Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue).OwningProcess
-    if ($stalePid) { Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 200 }
+    if ($stalePid) {
+        Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue
+        $waitN = 0
+        while ((Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue) -and $waitN -lt 20) {
+            Start-Sleep -Milliseconds 100
+            $waitN++
+        }
+    }
 
-    $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort -PassThru -WindowStyle Hidden
+    # Capture output to temp files so we can show a useful error if startup fails.
+    $kiroStdout = [System.IO.Path]::GetTempFileName()
+    $kiroStderr = [System.IO.Path]::GetTempFileName()
+    $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $kiroStdout `
+        -RedirectStandardError $kiroStderr
+
+    # Poll until ready. Dots show progress. TimeoutSec 1 prevents Invoke-RestMethod
+    # from hanging if kirocc accepts the TCP connection but does not respond.
+    $tries = 0
+    while ($tries -lt 30) {
+        Start-Sleep -Milliseconds 300
+        $tries++
+        if ($tries % 3 -eq 0) { Write-Host -NoNewline "." }
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
+            break
+        } catch { }
+    }
+    Write-Host ""
+
+    try {
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
+    } catch {
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+        $logLines = @(Get-Content $kiroStdout -ErrorAction SilentlyContinue) +
+                    @(Get-Content $kiroStderr -ErrorAction SilentlyContinue)
+        Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
+        Write-Host "--- kirocc log ---" -ForegroundColor Red
+        $logLines | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
+        Write-Host "------------------" -ForegroundColor Red
+        throw "kirocc failed to start on port $KiroccPort"
+    }
+    Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
     return $proc
 }
 ```
@@ -495,32 +557,52 @@ GOEXPERIMENT=jsonv2 go test ./...
 
 ### Issue 1: Startup Hang — "Starting kirocc gateway on :PORT..."
 
-**Symptom:** Script prints `Starting kirocc gateway on :3456...` and then hangs for 9+ seconds with no further output.
+**Symptom:** Script prints `Starting kirocc gateway on :3456...` and freezes. No further output. Affects second and subsequent runs when a stale kirocc is still bound to the port.
 
-**Root cause:** A previous kirocc instance is still listening on port 3456 (left over from a prior session). The new kirocc fails to bind the port and exits silently. The health-check curl hits the stale instance and never times out.
+**Root cause (stale process):** A previous kirocc instance left over from a prior session is still listening on port 3456. The new kirocc fails to bind and exits silently. The health-check curl hits the stale instance but receives no response (or an unexpected one).
 
-**Wrong fix (causes a different bug):**
+**Wrong fix 1 — missing `-s TCP:LISTEN` (kills claude, not kirocc):**
 ```bash
-# WRONG: returns ALL processes using the port, including the connected claude client
+# WRONG: lsof without -s TCP:LISTEN returns ALL processes using the port,
+# including claude clients. head -1 picks the client PID and kills the session.
 stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" | head -1)
-kill "$stale_pid"   # kills claude, not kirocc
+kill "$stale_pid"
 ```
 
-**Wrong fix 2 (port never freed with active sessions):**
+**Wrong fix 2 — SIGTERM instead of SIGKILL (port stays bound):**
 ```bash
-# WRONG: SIGTERM → Go's http.Server.Shutdown() → waits for connections to drain
-# Active claude sessions keep connections open indefinitely → port stays bound
-kill "$stale_pid"   # SIGTERM
+# WRONG: SIGTERM → Go's http.Server.Shutdown() → waits for active connections to drain.
+# Active claude sessions keep connections open indefinitely → port bound forever.
+kill "$stale_pid"   # implicit SIGTERM
+```
+
+**Wrong fix 3 — fixed sleep instead of polling (race on slow systems):**
+```bash
+# WRONG: 200ms may not be enough on a loaded system for the kernel to release the socket.
+kill -9 "$stale_pid" 2>/dev/null || true
+sleep 0.2   # race condition — new kirocc may fail to bind
 ```
 
 **Correct fix:**
 ```bash
-# -s TCP:LISTEN → only the process that has the socket in LISTEN state (kirocc itself)
-# kill -9 → SIGKILL bypasses graceful shutdown, releases the socket immediately
-stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null)
+# ss queries the kernel directly, never hangs, returns only LISTEN sockets.
+# lsof with -s TCP:LISTEN is the fallback with a 3s hard timeout.
+# kill -9 releases the socket immediately.
+# Wait loop ensures the port is free before starting the new process.
+local stale_pid
+stale_pid=$(ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null \
+    | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
+if [[ -z "$stale_pid" ]]; then
+    stale_pid=$(timeout 3 lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null || true)
+fi
 if [[ -n "$stale_pid" ]]; then
     kill -9 "$stale_pid" 2>/dev/null || true
-    sleep 0.2
+    local wait_n=0
+    while timeout 1 ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null | grep -q LISTEN \
+          && [[ $wait_n -lt 20 ]]; do
+        sleep 0.1
+        wait_n=$((wait_n + 1))
+    done
 fi
 ```
 
@@ -532,7 +614,7 @@ fi
 
 **Root cause:** The stale kirocc (using SQLite auth) is still on the port. The new kirocc (with `KIRO_API_KEY`) failed to start. The health check hits the old instance and reports "ready". All subsequent requests are authenticated with OAuth, not the API key.
 
-**Fix:** The `kill -9` + `lsof -s TCP:LISTEN` approach from Issue 1 ensures the new kirocc always starts fresh with the correct auth mode.
+**Fix:** The `ss`-first + `kill -9` approach from Issue 1 ensures the new kirocc always starts fresh with the correct auth mode.
 
 ### Issue 3: curl Health Check Hangs
 
@@ -543,7 +625,79 @@ fi
 curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1
 ```
 
-### Issue 4: Model ID Validation Errors
+### Issue 4: `lsof` Itself Hangs — Script Freezes at "Starting kirocc gateway..."
+
+**Symptom:** Script freezes immediately at `Starting kirocc gateway on :3456...` even when no stale process is running and the port is free. The hang occurs on second or subsequent runs.
+
+**Root cause:** `lsof` can block indefinitely on certain Linux systems — most commonly when NFS-mounted filesystems are present, when the kernel has zombie processes, or under high memory pressure. The command `lsof -ti tcp:PORT` scans all open file descriptors across all processes and can stall while waiting for an unresponsive NFS server or an unkillable zombie. Since the stale-PID detection runs before kirocc is even launched, the script appears stuck at the "Starting..." message with zero output.
+
+**Wrong fix (still hangs):**
+```bash
+# WRONG: still uses lsof as the primary command
+stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null)
+```
+
+**Correct fix — use `ss` as primary, `lsof` as a last-resort fallback with timeout:**
+```bash
+# ss talks directly to the kernel via netlink, never scans /proc, never hangs.
+stale_pid=$(ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null \
+    | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
+# Only call lsof if ss returned nothing, and cap it at 3 seconds.
+if [[ -z "$stale_pid" ]]; then
+    stale_pid=$(timeout 3 lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null || true)
+fi
+```
+
+**Windows equivalent** — `Get-NetTCPConnection` is already kernel-backed and does not have this problem.
+
+### Issue 5: No Error Details When kirocc Fails to Start
+
+**Symptom:** Script prints `ERROR: kirocc failed to start on port 3456` but gives no clue why — port conflict, bad binary, missing env var, etc.
+
+**Fix:** Redirect kirocc's output to a temp file and display it on failure:
+```bash
+local kirocc_log
+kirocc_log=$(mktemp /tmp/kirocc-XXXXXX.log)
+"$kirocc_bin" -port "$KIROCC_PORT" > "$kirocc_log" 2>&1 &
+
+# ... health check loop ...
+
+if ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
+    echo "ERROR: kirocc failed to start on port $KIROCC_PORT" >&2
+    echo "--- kirocc log ---" >&2
+    cat "$kirocc_log" >&2
+    echo "------------------" >&2
+    rm -f "$kirocc_log"
+    exit 1
+fi
+rm -f "$kirocc_log"
+```
+
+**PowerShell equivalent:**
+```powershell
+$kiroStdout = [System.IO.Path]::GetTempFileName()
+$kiroStderr = [System.IO.Path]::GetTempFileName()
+$proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
+    -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $kiroStdout -RedirectStandardError $kiroStderr
+
+# ... health check loop ...
+
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
+} catch {
+    $logLines = @(Get-Content $kiroStdout -ErrorAction SilentlyContinue) +
+                @(Get-Content $kiroStderr -ErrorAction SilentlyContinue)
+    Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
+    Write-Host "--- kirocc log ---" -ForegroundColor Red
+    $logLines | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
+    Write-Host "------------------" -ForegroundColor Red
+    throw "kirocc failed to start on port $KiroccPort"
+}
+Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
+```
+
+### Issue 6: Model ID Validation Errors
 
 **Symptom:** Kiro backend returns `ValidationException: Invalid model ID` for every request.
 
@@ -570,7 +724,8 @@ export KIROCC_MODEL_MAPPINGS='[
 4.  **Kiro (`-b kiro`)**: The hardest. Required spawning a 3rd-party Go binary (`kirocc`). Key challenges:
     - **Model ID translation** via `KIROCC_MODEL_MAPPINGS` (Claude Code injects date suffixes that Kiro rejects)
     - **API key auth** (`ksk_...` keys are used directly as bearer tokens + `TokenType: API_KEY` header, no OAuth exchange needed — discovered by disassembling the kiro-cli binary)
-    - **Process lifecycle management** (stale instance detection with `lsof -s TCP:LISTEN`, force-kill with `kill -9` to bypass Go's graceful shutdown)
-    - **Health check robustness** (`--max-time 1` on curl to prevent silent hangs)
+    - **Process lifecycle management** (`ss`-first stale detection, `kill -9` to bypass Go's graceful shutdown, poll-until-free wait loop instead of fixed sleep)
+    - **Health check robustness** (`--max-time 1` on curl, progress dots, kirocc log captured to temp file and shown on failure)
+    - **`lsof` hang avoidance** (replaced `lsof` with `ss` as primary PID detector — `lsof` blocks indefinitely on NFS/zombie-process systems)
 
 By following this guide, you can confidently integrate any future LLM provider, regardless of whether it uses native Anthropic, OpenAI format, or a proprietary enterprise gateway.
