@@ -389,6 +389,19 @@ except: print('false')
 
         echo "  Starting kirocc gateway on :$KIROCC_PORT..."
 
+        # Kill any stale kirocc already bound to this port so the fresh instance
+        # (with the correct auth — KIRO_API_KEY or SQLite) takes over.
+        # Use -s TCP:LISTEN to get only the LISTENING process, not connected clients.
+        # SIGKILL (-9) is intentional: SIGTERM triggers graceful shutdown which waits
+        # for active connections to drain (potentially forever) before releasing the
+        # listen socket. SIGKILL releases the socket immediately.
+        local stale_pid
+        stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null)
+        if [[ -n "$stale_pid" ]]; then
+            kill -9 "$stale_pid" 2>/dev/null || true
+            sleep 0.2   # let the OS release the port
+        fi
+
         # Map Claude Code's date-suffixed model names to Kiro model IDs.
         # Claude Code sends e.g. "claude-sonnet-4-6-20250514" but Kiro only
         # recognizes base names like "claude-sonnet-4.6".
@@ -405,12 +418,12 @@ except: print('false')
 
         # Wait for kirocc to be ready
         local tries=0
-        while ! curl -s "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
+        while ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
             sleep 0.3
             tries=$((tries + 1))
         done
 
-        if ! curl -s "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
+        if ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
             echo "ERROR: kirocc failed to start on port $KIROCC_PORT" >&2
             exit 1
         fi
