@@ -350,46 +350,58 @@ except: print('false')
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
     # Kill any stale kirocc already listening on this port.
-    # Use Stop-Process -Force (equivalent to kill -9 / SIGKILL) — NOT graceful termination.
-    # Graceful stop triggers Go's http.Server.Shutdown() which waits for active connections
-    # to drain before releasing the listen socket. Active claude sessions keep connections
-    # open indefinitely, so graceful stop leaves the port bound forever and the new
-    # kirocc (with the correct auth) can never start.
+    # Stop-Process -Force = SIGKILL equivalent — skips graceful shutdown which would hold
+    # the port open until all active connections drain (potentially forever).
     $stalePid = (Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue).OwningProcess
     if ($stalePid) {
         Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 200
+        # Wait until the port is actually free (max 2s), not just a fixed sleep.
+        $waitN = 0
+        while ((Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue) -and $waitN -lt 20) {
+            Start-Sleep -Milliseconds 100
+            $waitN++
+        }
     }
 
     # Map Claude Code's date-suffixed model names to Kiro model IDs.
-    # Claude Code appends dates internally (e.g. claude-sonnet-4-6-20250514).
-    # The Kiro backend rejects these — this table strips them before the request
-    # reaches the upstream API.
     $env:KIROCC_MODEL_MAPPINGS = '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]'
 
-    # kirocc inherits KIRO_API_KEY from the current process environment automatically.
+    # Capture kirocc output to temp files so we can show a useful error if startup fails.
+    $kiroStdout = [System.IO.Path]::GetTempFileName()
+    $kiroStderr = [System.IO.Path]::GetTempFileName()
     $proc = Start-Process -FilePath $kiroccBin -ArgumentList "-port",$KiroccPort `
-        -PassThru -WindowStyle Hidden
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $kiroStdout `
+        -RedirectStandardError $kiroStderr
 
-    # Poll until kirocc is accepting connections (typically < 100ms).
-    # TimeoutSec 1 prevents Invoke-RestMethod from hanging if kirocc accepts
-    # the TCP connection but does not respond.
+    # Poll until kirocc is accepting connections (typically < 100ms with API key auth).
+    # TimeoutSec 1 prevents Invoke-RestMethod from hanging if kirocc accepts the TCP
+    # connection but does not respond.
     $tries = 0
     while ($tries -lt 30) {
         Start-Sleep -Milliseconds 300
         $tries++
+        if ($tries % 3 -eq 0) { Write-Host -NoNewline "." }
         try {
             $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
             break
         } catch { }
     }
+    Write-Host ""
 
     try {
         $null = Invoke-RestMethod -Uri "http://127.0.0.1:$KiroccPort/v1/models" -TimeoutSec 1
     } catch {
         if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+        $logLines = @(Get-Content $kiroStdout -ErrorAction SilentlyContinue) +
+                    @(Get-Content $kiroStderr -ErrorAction SilentlyContinue)
+        Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
+        Write-Host "--- kirocc log ---" -ForegroundColor Red
+        $logLines | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
+        Write-Host "------------------" -ForegroundColor Red
         throw "kirocc failed to start on port $KiroccPort"
     }
+    Remove-Item $kiroStdout, $kiroStderr -ErrorAction SilentlyContinue
 
     Write-Host "  kirocc ready -> Kiro (AWS Claude)" -ForegroundColor Green
     return $proc

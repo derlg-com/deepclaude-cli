@@ -389,17 +389,23 @@ except: print('false')
 
         echo "  Starting kirocc gateway on :$KIROCC_PORT..."
 
-        # Kill any stale kirocc already bound to this port so the fresh instance
-        # (with the correct auth — KIRO_API_KEY or SQLite) takes over.
-        # Use -s TCP:LISTEN to get only the LISTENING process, not connected clients.
-        # SIGKILL (-9) is intentional: SIGTERM triggers graceful shutdown which waits
-        # for active connections to drain (potentially forever) before releasing the
-        # listen socket. SIGKILL releases the socket immediately.
+        # Kill any stale kirocc already bound to this port.
+        # Use ss (fast, no NFS hang risk) first; lsof with a 3s timeout as fallback.
+        # SIGKILL: SIGTERM triggers graceful shutdown that waits for active connections.
         local stale_pid
-        stale_pid=$(lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null)
+        stale_pid=$(ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
+        if [[ -z "$stale_pid" ]]; then
+            # ss couldn't determine PID; try lsof with a 3s timeout
+            stale_pid=$(timeout 3 lsof -ti tcp:"$KIROCC_PORT" -s TCP:LISTEN 2>/dev/null || true)
+        fi
         if [[ -n "$stale_pid" ]]; then
             kill -9 "$stale_pid" 2>/dev/null || true
-            sleep 0.2   # let the OS release the port
+            # Wait until the port is actually free (max 2s).
+            local wait_n=0
+            while timeout 1 ss -tlnp "sport = :$KIROCC_PORT" 2>/dev/null | grep -q LISTEN && [[ $wait_n -lt 20 ]]; do
+                sleep 0.1
+                wait_n=$((wait_n + 1))
+            done
         fi
 
         # Map Claude Code's date-suffixed model names to Kiro model IDs.
@@ -413,20 +419,32 @@ except: print('false')
           {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}
         ]'
 
-        "$kirocc_bin" -port "$KIROCC_PORT" > /dev/null 2>&1 &
+        local kirocc_log
+        kirocc_log=$(mktemp /tmp/kirocc-XXXXXX.log)
+        "$kirocc_bin" -port "$KIROCC_PORT" > "$kirocc_log" 2>&1 &
         PROXY_PID=$!
 
-        # Wait for kirocc to be ready
+        # Wait for kirocc to be ready (max ~9s).
         local tries=0
         while ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
             sleep 0.3
             tries=$((tries + 1))
+            # Print a dot every 3 tries (~1s) so the user sees progress.
+            if (( tries % 3 == 0 )); then
+                printf '.'
+            fi
         done
+        echo ""
 
         if ! curl -s --max-time 1 "http://127.0.0.1:$KIROCC_PORT/v1/models" > /dev/null 2>&1; then
             echo "ERROR: kirocc failed to start on port $KIROCC_PORT" >&2
+            echo "--- kirocc log ---" >&2
+            cat "$kirocc_log" >&2
+            echo "------------------" >&2
+            rm -f "$kirocc_log"
             exit 1
         fi
+        rm -f "$kirocc_log"
 
         echo "  kirocc ready → Kiro (AWS Claude)"
         echo ""
