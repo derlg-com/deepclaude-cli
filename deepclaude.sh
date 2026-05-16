@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # ── Load .env if present ──
 ENV_FILE="$SCRIPT_DIR/proxy/.env"
@@ -448,77 +448,67 @@ except: print('false')
 
         echo "  kirocc ready → Kiro (AWS Claude)"
         echo ""
-
-        export ANTHROPIC_BASE_URL="http://127.0.0.1:$KIROCC_PORT"
-        export ANTHROPIC_AUTH_TOKEN="kiro-managed"
-        # Override model names with dot-notation IDs that Kiro accepts
-        set_model_env
-        unset ANTHROPIC_API_KEY
-
-        exec claude "$@"
+        # kirocc is now running on :$KIROCC_PORT — fall through to start universal proxy
     fi
 
-    # OpenAI-compat backends (nvidia, doubleword) MUST go through the proxy
-    # for Anthropic↔OpenAI format translation.
-    # Kimi and other native-Anthropic backends can connect directly.
-    if needs_proxy; then
-        echo "  Starting translation proxy for $BACKEND..."
+    # ── Universal proxy on :3200 ─────────────────────────────────────────────
+    # All non-anthropic backends route through the proxy so /switch and /model
+    # commands can change the backend live without restarting Claude Code.
+    # Export all keys so the proxy discovers every configured backend.
+    export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
+    export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+    export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-}"
+    export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+    export KIMI_API_KEY="${KIMI_API_KEY:-}"
+    export DOUBLEWORD_API_KEY="${DOUBLEWORD_API_KEY:-}"
+    export KIROCC_PORT="${KIROCC_PORT:-3456}"
+    # KIRO_API_KEY already exported above (used by kirocc itself)
 
-        # Pass all env vars so proxy can find the keys
-        export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
-        export KIMI_API_KEY="${KIMI_API_KEY:-}"
-        export DOUBLEWORD_API_KEY="${DOUBLEWORD_API_KEY:-}"
-        export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
-        export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
-        export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-}"
+    local canonical
+    canonical=$(canonical_backend)
 
-        local canonical
-        canonical=$(canonical_backend)
-
-        local port_file
-        port_file=$(mktemp)
-        # stdout = port number only; stderr = proxy logs (to terminal)
-        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" --mode "$canonical" > "$port_file" 2>/dev/null &
-        PROXY_PID=$!
-
-        local tries=0
-        while [[ ! -s "$port_file" ]] && [[ $tries -lt 30 ]]; do
-            sleep 0.2
-            tries=$((tries + 1))
+    # Kill any stale proxy already bound to :3200.
+    local stale_proxy_pid
+    stale_proxy_pid=$(ss -tlnp "sport = :3200" 2>/dev/null | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
+    if [[ -z "$stale_proxy_pid" ]]; then
+        stale_proxy_pid=$(timeout 3 lsof -ti tcp:3200 -s TCP:LISTEN 2>/dev/null || true)
+    fi
+    if [[ -n "$stale_proxy_pid" ]]; then
+        kill -9 "$stale_proxy_pid" 2>/dev/null || true
+        local wp=0
+        while timeout 1 ss -tlnp "sport = :3200" 2>/dev/null | grep -q LISTEN && [[ $wp -lt 10 ]]; do
+            sleep 0.1; wp=$((wp + 1))
         done
-
-        if [[ ! -s "$port_file" ]]; then
-            echo "ERROR: Proxy failed to start" >&2
-            cat "$port_file" >&2 2>/dev/null || true
-            rm -f "$port_file"
-            exit 1
-        fi
-
-        # Extract the bare port number (only digits on a line by itself)
-        local proxy_port
-        proxy_port=$(grep -oE '^[0-9]+$' "$port_file" | head -1)
-        rm -f "$port_file"
-
-        if [[ -z "$proxy_port" ]]; then
-            echo "ERROR: Could not determine proxy port" >&2
-            exit 1
-        fi
-
-        echo "  Proxy on :$proxy_port → $RESOLVED_URL"
-        echo ""
-
-        export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
-        # The proxy handles auth, so we use a dummy token
-        export ANTHROPIC_AUTH_TOKEN="proxy-managed"
-        set_model_env
-        unset ANTHROPIC_API_KEY
-
-        exec claude "$@"
     fi
 
-    # Native Anthropic-format backends (deepseek, openrouter, fireworks, kimi)
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    echo "  Starting provider proxy on :3200 (mode: $canonical)..."
+    local proxy_log
+    proxy_log=$(mktemp /tmp/deepclaude-proxy-XXXXXX.log)
+    node "$SCRIPT_DIR/proxy/start-proxy.js" --port 3200 --mode "$canonical" > /dev/null 2>"$proxy_log" &
+    PROXY_PID=$!
+
+    local tries=0
+    while ! curl -s --max-time 1 "http://127.0.0.1:3200/_proxy/status" > /dev/null 2>&1 && [[ $tries -lt 30 ]]; do
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+
+    if ! curl -s --max-time 1 "http://127.0.0.1:3200/_proxy/status" > /dev/null 2>&1; then
+        echo "ERROR: Provider proxy failed to start on :3200" >&2
+        echo "--- proxy log ---" >&2
+        cat "$proxy_log" >&2
+        echo "-----------------" >&2
+        rm -f "$proxy_log"
+        exit 1
+    fi
+    rm -f "$proxy_log"
+
+    echo "  Proxy ready — use /switch <provider> or /model <model> to switch live"
+    echo ""
+
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:3200"
+    export ANTHROPIC_AUTH_TOKEN="proxy-managed"
+    export DEEPCLAUDE_PROXY_PORT="3200"
     set_model_env
     unset ANTHROPIC_API_KEY
 

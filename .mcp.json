@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deepclaude": {
+      "command": "node",
+      "args": ["/home/rayu/deepclaude-cli/mcp/provider-switcher.mjs"],
+      "env": {
+        "DEEPCLAUDE_PROXY_PORT": "3200"
+      }
+    }
+  }
+}

@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 import { startModelProxy } from './model-proxy.js';
 
+const KIROCC_PORT = process.env.KIROCC_PORT || '3456';
 const BACKEND_DEFS = {
-    deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
+    deepseek:   { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
-    fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
-    kimi: { url: 'https://api.kimi.com/coding/', keyEnv: 'KIMI_API_KEY' },
-    nvidia: { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
+    fireworks:  { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
+    kimi:       { url: 'https://api.kimi.com/coding/', keyEnv: 'KIMI_API_KEY' },
+    nvidia:     { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
     doubleword: { url: 'https://api.doubleword.ai/v1', keyEnv: 'DOUBLEWORD_API_KEY' },
+    // kiro routes to local kirocc gateway; kirocc manages its own auth
+    kiro:       { url: `http://127.0.0.1:${KIROCC_PORT}`, keyEnv: 'KIRO_API_KEY', localDummy: 'kiro-managed' },
 };
 
 // Parse --mode from argv regardless of position
@@ -31,8 +34,10 @@ const apiKey = positional[1] || process.env.CHEAPCLAUDE_API_KEY;
 const backends = {};
 for (const [name, def] of Object.entries(BACKEND_DEFS)) {
     const key = process.env[def.keyEnv];
-    if (key || !(targetUrl && apiKey)) {
-        backends[name] = { url: def.url, apiKey: key || null };
+    // For local backends (kiro), use a dummy key if no real key — auth is handled by kirocc
+    const resolvedKey = key || def.localDummy || null;
+    if (resolvedKey || !(targetUrl && apiKey)) {
+        backends[name] = { url: def.url, apiKey: resolvedKey };
     }
 }
 

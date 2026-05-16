@@ -1,4 +1,4 @@
-import { createServer } from 'http';
+import { createServer, request as httpRequest } from 'http';
 import { request as httpsRequest } from 'https';
 import { URL } from 'url';
 import { Transform } from 'stream';
@@ -55,6 +55,7 @@ const PRICING_PER_M = {
     fireworks:  { input: 1.74,  output: 3.48 },
     nvidia:     { input: 0.44,  output: 0.87 },
     kimi:       { input: 0.00,  output: 0.00 },  // subscription-based
+    kiro:       { input: 0.00,  output: 0.00 },  // subscription-based
     doubleword: { input: 0.44,  output: 0.87 },
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
@@ -65,6 +66,9 @@ const PRICING_PER_M = {
  * Messages format. These require full request/response translation.
  */
 const OPENAI_COMPAT_BACKENDS = new Set(['nvidia', 'doubleword']);
+
+// Backends that route to a local HTTP gateway (no TLS, no auth header injection)
+const LOCAL_HTTP_BACKENDS = new Set(['kiro']);
 
 /**
  * Backends that need anthropic-beta and other Anthropic-specific headers
@@ -149,6 +153,10 @@ function stripAllThinkingBlocks(body) {
     for (const msg of body.messages) {
         if (!Array.isArray(msg.content)) continue;
         msg.content = msg.content.filter(b => b.type !== 'thinking');
+        // Also remove reasoning_content field from tool-call messages (kimi rejects it)
+        for (const block of msg.content) {
+            if (block.reasoning_content !== undefined) delete block.reasoning_content;
+        }
     }
 }
 
@@ -188,6 +196,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             apiKey: startBackend ? startBackend.apiKey : apiKey,
             useBearer: startBackend ? startBackend.useBearer : initialBearer,
             hadNonAnthropicSession: !!startBackend,
+            modelOverride: null,
         };
 
         let reqCount = 0;
@@ -258,6 +267,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     clientRes.writeHead(200, { 'content-type': 'application/json' });
                     clientRes.end(JSON.stringify({
                         mode: state.mode,
+                        model_override: state.modelOverride || null,
+                        available_backends: ['anthropic', ...Object.keys(allBackends)],
                         uptime: Math.round((Date.now() - t0Global) / 1000),
                         requests: reqCount,
                     }));
@@ -307,6 +318,21 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     clientRes.end(JSON.stringify({ error: 'Use POST' }));
                     return;
                 }
+                if (urlPath === '/_proxy/model' && clientReq.method === 'POST') {
+                    const chunks = [];
+                    clientReq.on('data', c => chunks.push(c));
+                    clientReq.on('end', () => {
+                        const body = Buffer.concat(chunks).toString();
+                        const m = body.match(/model=([^&]*)/);
+                        const model = m ? decodeURIComponent(m[1]).trim() : '';
+                        state.modelOverride = model || null;
+                        const msg = model ? `Model override set: ${model}` : 'Model override cleared';
+                        console.error(`[MODEL-PROXY] ${msg}`);
+                        clientRes.writeHead(200, { 'content-type': 'application/json' });
+                        clientRes.end(JSON.stringify({ model_override: state.modelOverride }));
+                    });
+                    return;
+                }
                 clientRes.writeHead(404, { 'content-type': 'application/json' });
                 clientRes.end(JSON.stringify({ error: 'Not found' }));
                 return;
@@ -349,7 +375,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             if (isModelCall) {
                 delete headers['authorization'];
                 delete headers['x-api-key'];
-                if (state.useBearer) {
+                if (LOCAL_HTTP_BACKENDS.has(state.mode)) {
+                    // kiro: kirocc manages its own auth — don't inject any auth header
+                } else if (state.useBearer) {
                     headers['authorization'] = `Bearer ${state.apiKey}`;
                 } else {
                     headers['x-api-key'] = state.apiKey;
@@ -384,7 +412,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     } catch { /* pass through */ }
                 }
 
-                if (isModelCall && parsedAnthropicBody && MODEL_REMAP[state.mode]) {
+                if (isModelCall && parsedAnthropicBody && state.modelOverride) {
+                    console.error(`[MODEL-PROXY] #${reqId} model override: ${parsedAnthropicBody.model} → ${state.modelOverride}`);
+                    parsedAnthropicBody.model = state.modelOverride;
+                    targetModel = state.modelOverride;
+                } else if (isModelCall && parsedAnthropicBody && MODEL_REMAP[state.mode]) {
                     const mapped = MODEL_REMAP[state.mode][parsedAnthropicBody.model];
                     if (mapped) {
                         console.error(`[MODEL-PROXY] #${reqId} model remap: ${parsedAnthropicBody.model} → ${mapped}`);
@@ -393,6 +425,12 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     } else {
                         targetModel = parsedAnthropicBody.model;
                     }
+                }
+
+                // Non-kiro backends don't support thinking — strip the top-level
+                // "thinking" param so providers like kimi don't expect reasoning_content.
+                if (isModelCall && parsedAnthropicBody && !LOCAL_HTTP_BACKENDS.has(state.mode)) {
+                    delete parsedAnthropicBody.thinking;
                 }
 
                 // Strip thinking blocks before forwarding
@@ -420,16 +458,18 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     body = Buffer.from(JSON.stringify(parsedAnthropicBody));
                 }
 
+                const isLocalBackend = LOCAL_HTTP_BACKENDS.has(state.mode);
                 const opts = {
                     hostname: dest.hostname,
-                    port: dest.port || 443,
+                    port: dest.port || (isLocalBackend ? 80 : 443),
                     path: fullPath,
                     method: clientReq.method,
                     headers: { ...headers, 'content-length': body.length },
                     timeout: REQUEST_TIMEOUT_MS,
                 };
 
-                const proxyReq = httpsRequest(opts, (proxyRes) => {
+                const makeRequest = isLocalBackend ? httpRequest : httpsRequest;
+                const proxyReq = makeRequest(opts, (proxyRes) => {
                     if (isModelCall) {
                         const ttfb = Date.now() - t0;
                         console.error(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
