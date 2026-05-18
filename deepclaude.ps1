@@ -79,12 +79,17 @@ $DoublewordKey = if ($env:DOUBLEWORD_API_KEY) { $env:DOUBLEWORD_API_KEY } else {
 $KiroKey = if ($env:KIRO_API_KEY) { $env:KIRO_API_KEY } else {
     [Environment]::GetEnvironmentVariable("KIRO_API_KEY", "User")
 }
+$AwsKey = if ($env:AWS_API_KEY) { $env:AWS_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("AWS_API_KEY", "User")
+}
 
 $NvidiaModel = if ($env:NVIDIA_MODEL) { $env:NVIDIA_MODEL } else { "moonshotai/kimi-k2.6" }
 $KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
 $DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
 $DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
 $KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.6" }
+$AwsModel = if ($env:AWS_MODEL) { $env:AWS_MODEL } else { "global.anthropic.claude-sonnet-4-6" }
+$AwsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-east-1" }
 $KiroccPort = 3456
 
 $Providers = @{
@@ -139,6 +144,13 @@ $Providers = @{
         opus = $KiroModel; sonnet = $KiroModel
         haiku = "claude-haiku-4.5"; subagent = "claude-haiku-4.5"
     }
+    aws = @{
+        name = "AWS Bedrock"; needsProxy = $true; canonical = "aws"
+        url = "https://bedrock-runtime.$AwsRegion.amazonaws.com"
+        key = $AwsKey; keyName = "AWS_API_KEY"
+        opus = $AwsModel; sonnet = $AwsModel
+        haiku = $AwsModel; subagent = $AwsModel
+    }
 }
 
 function Get-KeyDisplay($k) {
@@ -158,6 +170,7 @@ if ($Status) {
     Write-Host "    KIMI_API_KEY:        $(Get-KeyDisplay $KimiKey)"
     Write-Host "    DOUBLEWORD_API_KEY:  $(Get-KeyDisplay $DoublewordKey)"
     Write-Host "    KIRO_API_KEY:        $(Get-KeyDisplay $KiroKey)"
+    Write-Host "    AWS_API_KEY:         $(Get-KeyDisplay $AwsKey)"
     $kiroccPath = Get-Command kirocc -ErrorAction SilentlyContinue
     Write-Host "    kirocc:              $(if ($kiroccPath) { 'installed' } else { 'NOT FOUND' })"
     Write-Host "`n  Backends:" -ForegroundColor Yellow
@@ -168,6 +181,7 @@ if ($Status) {
     Write-Host "    deepclaude -b kimi      # Kimi Code (subscription)"
     Write-Host "    deepclaude -b dw        # Doubleword AI"
     Write-Host "    deepclaude -b kiro      # Kiro (AWS Claude, via kirocc)"
+    Write-Host "    deepclaude -b aws       # AWS Bedrock (your own AWS account)"
     Write-Host "    deepclaude -b anthropic # Normal Claude Code"
     Write-Host ""
     exit 0
@@ -187,6 +201,7 @@ if ($Cost) {
     Write-Host "  Kimi Code       subscription         Anthropic-native"
     Write-Host "  Doubleword      `$0.44      `$0.87      OpenAI-compat"
     Write-Host "  Kiro            subscription         AWS Claude (kirocc)"
+    Write-Host "  AWS Bedrock     `$3.00      `$15.00     Your own AWS account"
     Write-Host "  Anthropic       `$3.00      `$15.00     Official"
     Write-Host ""
     exit 0
@@ -242,8 +257,24 @@ function Start-TranslationProxy {
     $canonical = if ($Provider.canonical) { $Provider.canonical } else { $Backend }
     $tempFile = [System.IO.Path]::GetTempFileName()
 
+    # Make sure every backend's keys + AWS region are visible to the Node proxy.
+    foreach ($pair in @(
+        @{ k = 'DEEPSEEK_API_KEY';   v = $DeepSeekKey },
+        @{ k = 'OPENROUTER_API_KEY'; v = $OpenRouterKey },
+        @{ k = 'FIREWORKS_API_KEY';  v = $FireworksKey },
+        @{ k = 'NVIDIA_API_KEY';     v = $NvidiaKey },
+        @{ k = 'KIMI_API_KEY';       v = $KimiKey },
+        @{ k = 'DOUBLEWORD_API_KEY'; v = $DoublewordKey },
+        @{ k = 'KIRO_API_KEY';       v = $KiroKey },
+        @{ k = 'AWS_API_KEY';        v = $AwsKey },
+        @{ k = 'AWS_REGION';         v = $AwsRegion },
+        @{ k = 'AWS_MODEL';          v = $AwsModel }
+    )) {
+        if ($pair.v) { [Environment]::SetEnvironmentVariable($pair.k, $pair.v, 'Process') }
+    }
+
     $proxyProc = Start-Process -FilePath "node" `
-        -ArgumentList @($proxyScript, $Provider.url, $Provider.key) `
+        -ArgumentList @($proxyScript, $Provider.url, $Provider.key, "--mode", $canonical) `
         -PassThru -WindowStyle Hidden -RedirectStandardOutput $tempFile
 
     $tries = 0
@@ -422,7 +453,7 @@ if ($Remote) {
     }
 
     $p = $Providers[$Backend]
-    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" -ForegroundColor Red; exit 1 }
+    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, aws, anthropic" -ForegroundColor Red; exit 1 }
     if (-not $p.needsKirocc -and -not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
     # Kiro backend in remote mode
@@ -507,7 +538,7 @@ if ($Backend -eq "anthropic") {
 }
 
 $p = $Providers[$Backend]
-if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" -ForegroundColor Red; exit 1 }
+if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, nv, kimi, dw, kiro, aws, anthropic" -ForegroundColor Red; exit 1 }
 if (-not $p.needsKirocc -and -not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
 Write-Host "`n  Launching Claude Code via $($p.name)..." -ForegroundColor Cyan
