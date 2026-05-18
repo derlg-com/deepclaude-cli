@@ -34,6 +34,8 @@ NVIDIA_URL="https://integrate.api.nvidia.com/v1"
 KIMI_URL="https://api.kimi.com/coding/"
 DOUBLEWORD_URL="https://api.doubleword.ai/v1"
 KIROCC_PORT=3456  # Port for kirocc gateway (Kiro backend)
+AWS_REGION_DEFAULT="${AWS_REGION:-us-east-1}"
+AWS_URL="https://bedrock-runtime.${AWS_REGION_DEFAULT}.amazonaws.com"
 
 # Read default from .env API_PROVIDER or fallback to ds
 DEFAULT_BACKEND="${API_PROVIDER:-ds}"
@@ -124,8 +126,19 @@ resolve_backend() {
             opus="${KIRO_MODEL:-claude-sonnet-4.6}"; sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
             haiku="${KIRO_MODEL:-claude-haiku-4.5}"; subagent="${KIRO_MODEL:-claude-haiku-4.5}"
             ;;
+        aws|bedrock)
+            # AWS Bedrock with API key (ABSK prefix). Region from AWS_REGION (default us-east-1).
+            # Models use Bedrock inference-profile IDs (e.g. us.anthropic.claude-sonnet-4-5-...).
+            key="${AWS_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: AWS_API_KEY not set" >&2; exit 1; }
+            url="$AWS_URL"
+            opus="${AWS_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+            sonnet="${AWS_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+            haiku="${AWS_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+            subagent="${AWS_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+            ;;
         anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, nv, kimi, dw, kiro, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, nv, kimi, dw, kiro, aws, anthropic" >&2; exit 1 ;;
     esac
     RESOLVED_URL="$url"; RESOLVED_KEY="$key"
     RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
@@ -281,7 +294,7 @@ run_benchmark() {
 # ── Determine if backend needs the Node.js proxy (OpenAI-compat backends) ──
 needs_proxy() {
     case "$BACKEND" in
-        nv|nvidia|dw|doubleword) return 0 ;;
+        nv|nvidia|dw|doubleword|aws|bedrock) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -304,6 +317,7 @@ canonical_backend() {
         kimi)          echo "kimi" ;;
         dw|doubleword) echo "doubleword" ;;
         kiro)          echo "kiro" ;;
+        aws|bedrock)   echo "aws" ;;
         *)             echo "$BACKEND" ;;
     esac
 }
@@ -471,6 +485,9 @@ except: print('false')
         export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
         export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
         export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-}"
+        export AWS_API_KEY="${AWS_API_KEY:-}"
+        export AWS_REGION="${AWS_REGION:-us-east-1}"
+        export AWS_MODEL="${AWS_MODEL:-}"
 
         local canonical
         canonical=$(canonical_backend)

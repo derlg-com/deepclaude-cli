@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 import { startModelProxy } from './model-proxy.js';
 
+const KIROCC_PORT = process.env.KIROCC_PORT || '3456';
+const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+
 const BACKEND_DEFS = {
-    deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
+    deepseek:   { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
-    fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
-    kimi: { url: 'https://api.kimi.com/coding/', keyEnv: 'KIMI_API_KEY' },
-    nvidia: { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
+    fireworks:  { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
+    kimi:       { url: 'https://api.kimi.com/coding/', keyEnv: 'KIMI_API_KEY' },
+    nvidia:     { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
     doubleword: { url: 'https://api.doubleword.ai/v1', keyEnv: 'DOUBLEWORD_API_KEY' },
+    // kiro routes to local kirocc gateway; kirocc manages its own auth
+    kiro:       { url: `http://127.0.0.1:${KIROCC_PORT}`, keyEnv: 'KIRO_API_KEY', localDummy: 'kiro-managed' },
+    // AWS Bedrock — base URL only; per-request path is built from AWS_MODEL
+    aws:        { url: `https://bedrock-runtime.${AWS_REGION}.amazonaws.com`, keyEnv: 'AWS_API_KEY' },
 };
 
 // Parse --mode from argv regardless of position
@@ -31,14 +38,13 @@ const apiKey = positional[1] || process.env.CHEAPCLAUDE_API_KEY;
 const backends = {};
 for (const [name, def] of Object.entries(BACKEND_DEFS)) {
     const key = process.env[def.keyEnv];
-    if (key || !(targetUrl && apiKey)) {
-        backends[name] = { url: def.url, apiKey: key || null };
+    const resolvedKey = key || def.localDummy || null;
+    if (resolvedKey || !(targetUrl && apiKey)) {
+        backends[name] = { url: def.url, apiKey: resolvedKey };
     }
 }
 
 if (targetUrl && apiKey) {
-    // Legacy-compatible mode: URL + key provided as positional args
-    // Now also respects --mode flag for setting the default backend
     const hasBackends = Object.keys(backends).length > 0;
     const defaultMode = cliMode || undefined;
 
@@ -51,7 +57,6 @@ if (targetUrl && apiKey) {
     });
     console.log(port);
 } else {
-    // Standalone mode with live toggle
     const fallbackUrl = backends.deepseek?.url || 'https://api.deepseek.com/anthropic';
     const fallbackKey = backends.deepseek?.apiKey || 'unused';
     const defaultMode = cliMode || 'anthropic';

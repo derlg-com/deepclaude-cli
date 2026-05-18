@@ -47,6 +47,17 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek-ai/DeepSeek-V4-Pro',
         'claude-haiku-4-5-20251001':  'deepseek-ai/DeepSeek-V4-Pro',
     },
+    // AWS Bedrock — map to inference-profile model IDs. Override via AWS_MODEL env var.
+    aws: (() => {
+        const m = process.env.AWS_MODEL || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
+        return {
+            'claude-opus-4-6':    m,
+            'claude-opus-4-7':    m,
+            'claude-sonnet-4-6':  m,
+            'claude-sonnet-4-5-20250929': m,
+            'claude-haiku-4-5-20251001':  m,
+        };
+    })(),
 };
 
 const PRICING_PER_M = {
@@ -56,6 +67,7 @@ const PRICING_PER_M = {
     nvidia:     { input: 0.44,  output: 0.87 },
     kimi:       { input: 0.00,  output: 0.00 },  // subscription-based
     doubleword: { input: 0.44,  output: 0.87 },
+    aws:        { input: 3.00,  output: 15.00 },  // AWS Bedrock Claude Sonnet
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
@@ -67,10 +79,19 @@ const PRICING_PER_M = {
 const OPENAI_COMPAT_BACKENDS = new Set(['nvidia', 'doubleword']);
 
 /**
+ * Backends that use AWS Bedrock InvokeModelWithResponseStream:
+ *  - URL contains the model ID
+ *  - Bearer auth (with AWS API key ABSK...)
+ *  - Body has no `model` field, requires `anthropic_version: "bedrock-2023-05-31"`
+ *  - Response is AWS Event Stream binary (must decode → Anthropic SSE)
+ */
+const BEDROCK_BACKENDS = new Set(['aws']);
+
+/**
  * Backends that need anthropic-beta and other Anthropic-specific headers
  * stripped (they reject unknown headers).
  */
-const STRIP_ANTHROPIC_HEADERS = new Set(['kimi', 'nvidia', 'doubleword']);
+const STRIP_ANTHROPIC_HEADERS = new Set(['kimi', 'nvidia', 'doubleword', 'aws']);
 
 /**
  * Transform stream that intercepts SSE events and injects missing `usage`
@@ -159,6 +180,104 @@ function stripUnsignedThinkingBlocks(body) {
         msg.content = msg.content.filter(
             block => block.type !== 'thinking' || block.signature
         );
+    }
+}
+
+/**
+ * Decodes AWS Bedrock Event Stream (binary framing) into Anthropic SSE.
+ *
+ * Frame layout: [totalLen:4 BE][headersLen:4 BE][preludeCRC:4][headers][payload][messageCRC:4]
+ * Each frame's payload (for event-type "chunk") is JSON: { "bytes": "<base64 Anthropic event>" }.
+ * We base64-decode that and re-emit as an SSE event Claude Code understands.
+ */
+class BedrockEventStreamToSSE extends Transform {
+    constructor(onUsage) {
+        super();
+        this._buf = Buffer.alloc(0);
+        this._onUsage = onUsage;
+        this._in = 0;
+        this._out = 0;
+    }
+
+    _transform(chunk, _enc, cb) {
+        this._buf = Buffer.concat([this._buf, chunk]);
+        this._parseFrames();
+        cb();
+    }
+
+    _parseFrames() {
+        while (this._buf.length >= 12) {
+            const totalLen = this._buf.readUInt32BE(0);
+            if (totalLen < 16 || totalLen > 16 * 1024 * 1024) { this._buf = Buffer.alloc(0); return; }
+            if (this._buf.length < totalLen) return; // wait for full frame
+            const headersLen = this._buf.readUInt32BE(4);
+            const headersStart = 12;
+            const payloadStart = headersStart + headersLen;
+            const payloadEnd = totalLen - 4;
+            const headers = this._parseHeaders(headersStart, payloadStart);
+            const payload = this._buf.slice(payloadStart, payloadEnd);
+            this._handle(headers, payload);
+            this._buf = this._buf.slice(totalLen);
+        }
+    }
+
+    _parseHeaders(start, end) {
+        const headers = {};
+        let off = start;
+        while (off < end) {
+            if (off + 1 > end) break;
+            const nameLen = this._buf.readUInt8(off); off += 1;
+            if (off + nameLen > end) break;
+            const name = this._buf.slice(off, off + nameLen).toString(); off += nameLen;
+            if (off + 1 > end) break;
+            const type = this._buf.readUInt8(off); off += 1;
+            if (type === 7) { // string
+                if (off + 2 > end) break;
+                const vLen = this._buf.readUInt16BE(off); off += 2;
+                if (off + vLen > end) break;
+                headers[name] = this._buf.slice(off, off + vLen).toString();
+                off += vLen;
+            } else {
+                break; // unknown type — bail
+            }
+        }
+        return headers;
+    }
+
+    _handle(headers, payload) {
+        const eventType = headers[':event-type'];
+        const messageType = headers[':message-type'];
+
+        if (messageType === 'exception' || messageType === 'error') {
+            let msg = payload.toString();
+            try { const j = JSON.parse(msg); msg = j.message || msg; } catch {}
+            this.push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: msg.substring(0, 500) } })}\n\n`);
+            return;
+        }
+
+        if (eventType !== 'chunk') return;
+
+        try {
+            const wrapper = JSON.parse(payload.toString());
+            if (!wrapper.bytes) return;
+            const decoded = Buffer.from(wrapper.bytes, 'base64').toString();
+            const event = JSON.parse(decoded);
+            const name = event.type;
+            if (event.type === 'message_start' && event.message?.usage) {
+                this._in = event.message.usage.input_tokens || 0;
+            }
+            if (event.type === 'message_delta' && event.usage) {
+                this._out = event.usage.output_tokens || 0;
+            }
+            this.push(`event: ${name}\ndata: ${JSON.stringify(event)}\n\n`);
+        } catch (e) {
+            console.error('[BEDROCK] failed to decode event:', e.message);
+        }
+    }
+
+    _flush(cb) {
+        if (this._onUsage) this._onUsage(this._in, this._out);
+        cb();
     }
 }
 
@@ -316,6 +435,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const isAnthropicMode = state.mode === 'anthropic';
             const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
             const isOpenAICompat = isModelCall && OPENAI_COMPAT_BACKENDS.has(state.mode);
+            const isBedrock = isModelCall && BEDROCK_BACKENDS.has(state.mode);
             const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
 
             // Build upstream path
@@ -324,6 +444,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 if (isOpenAICompat) {
                     // OpenAI-compatible: always POST to /v1/chat/completions
                     fullPath = '/v1/chat/completions';
+                } else if (isBedrock) {
+                    // Path built later (need the model ID from the parsed body); placeholder for now.
+                    fullPath = '/__bedrock_pending__';
                 } else {
                     const base = state.target.pathname.replace(/\/$/, '');
                     let overlap = '';
@@ -349,7 +472,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             if (isModelCall) {
                 delete headers['authorization'];
                 delete headers['x-api-key'];
-                if (state.useBearer) {
+                if (isBedrock) {
+                    // Bedrock uses Bearer auth with the API key (ABSK...).
+                    headers['authorization'] = `Bearer ${state.apiKey}`;
+                } else if (state.useBearer) {
                     headers['authorization'] = `Bearer ${state.apiKey}`;
                 } else {
                     headers['x-api-key'] = state.apiKey;
@@ -367,6 +493,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     headers['content-type'] = 'application/json';
                     // For streaming, set Accept header
                     headers['accept'] = 'text/event-stream';
+                }
+
+                // Bedrock: server replies with AWS Event Stream binary
+                if (isBedrock) {
+                    delete headers['anthropic-version'];
+                    delete headers['anthropic-beta'];
+                    headers['content-type'] = 'application/json';
+                    headers['accept'] = 'application/vnd.amazon.eventstream';
                 }
             }
 
@@ -416,6 +550,26 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     const openaiBody = anthropicToOpenAI(parsedAnthropicBody, targetModel || parsedAnthropicBody.model);
                     body = Buffer.from(JSON.stringify(openaiBody));
                     console.error(`[MODEL-PROXY] #${reqId} translated Anthropic→OpenAI (stream=${openaiBody.stream})`);
+                } else if (isBedrock && parsedAnthropicBody) {
+                    // Bedrock rejects any unknown top-level field with "Extra inputs are not permitted".
+                    // Claude Code sends fields like context_management, mcp_servers, metadata,
+                    // service_tier, etc. that Bedrock doesn't accept. Use a strict whitelist of fields
+                    // AWS Bedrock documents as supported (see model-parameters-anthropic-claude-messages-request-response).
+                    const modelId = targetModel || parsedAnthropicBody.model;
+                    fullPath = `/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`;
+                    const BEDROCK_ALLOWED = [
+                        'max_tokens', 'system', 'messages',
+                        'temperature', 'top_p', 'top_k',
+                        'tools', 'tool_choice', 'stop_sequences',
+                        'thinking',         // extended thinking (Claude on Bedrock supports it)
+                        'output_config',    // effort param (with effort-2025-11-24 beta)
+                    ];
+                    const bedrockBody = { anthropic_version: 'bedrock-2023-05-31' };
+                    for (const k of BEDROCK_ALLOWED) {
+                        if (parsedAnthropicBody[k] !== undefined) bedrockBody[k] = parsedAnthropicBody[k];
+                    }
+                    body = Buffer.from(JSON.stringify(bedrockBody));
+                    console.error(`[MODEL-PROXY] #${reqId} → bedrock ${modelId} (${Object.keys(bedrockBody).length} fields)`);
                 } else if (isModelCall && parsedAnthropicBody) {
                     body = Buffer.from(JSON.stringify(parsedAnthropicBody));
                 }
@@ -458,6 +612,24 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
 
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
+                    const isAwsEventStream = ct.includes('application/vnd.amazon.eventstream');
+
+                    // ── Bedrock AWS Event Stream → Anthropic SSE ──
+                    if (isModelCall && isBedrock && isAwsEventStream) {
+                        clientRes.writeHead(proxyRes.statusCode, {
+                            'content-type': 'text/event-stream',
+                            'cache-control': 'no-cache',
+                            'connection': 'keep-alive',
+                        });
+                        const decoder = new BedrockEventStreamToSSE(
+                            (inp, out) => recordUsage(state.mode, inp, out)
+                        );
+                        proxyRes.pipe(decoder).pipe(clientRes);
+                        proxyRes.on('end', () => {
+                            console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (Bedrock→SSE)`);
+                        });
+                        return;
+                    }
 
                     // ── OpenAI-compat streaming → translate back to Anthropic SSE ──
                     if (isModelCall && isOpenAICompat && isSSE) {
