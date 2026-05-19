@@ -1,6 +1,6 @@
 # deepclaude
 
-Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **Kiro**, **Nvidia NIM**, **Kimi Code**, **Doubleword AI**, or any Anthropic-compatible backend. Same UX, up to 17× cheaper — or even **free with a subscription**.
+Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **Kiro**, **AWS Bedrock**, **Nvidia NIM**, **Kimi Code**, **Doubleword AI**, or any Anthropic-compatible backend. Same UX, up to 17× cheaper — or even **free with a subscription**.
 
 ![Remote control running DeepSeek V4 Pro in the browser](screenshots/remote-control-deepseek.png)
 
@@ -49,8 +49,9 @@ Copy-Item deepclaude.ps1 "$env:USERPROFILE\.local\bin\deepclaude.ps1"
 ### 4. Use it
 
 ```bash
-deepclaude                      # Launch with default backend (DeepSeek)
+deepclaude                      # Launch with default backend (from API_PROVIDER in .env)
 deepclaude -b kiro              # Use Kiro (AWS Claude, subscription)
+deepclaude -b aws               # Use AWS Bedrock (your own AWS account)
 deepclaude -b nv                # Use Nvidia NIM
 deepclaude -b kimi              # Use Kimi Code
 deepclaude -b dw                # Use Doubleword AI
@@ -71,6 +72,7 @@ deepclaude --benchmark          # Latency test
 |---|---|---|---|---|---|
 | **DeepSeek** (default) | `-b ds` | $0.44 | $0.87 | Anthropic-native | Auto context caching |
 | **Kiro** ⭐ | `-b kiro` | subscription | subscription | AWS (kirocc gateway) | Claude Sonnet 4.6 via Kiro Pro |
+| **AWS Bedrock** | `-b aws` | $3.00 | $15.00 | Bedrock (proxy) | Your own AWS account, Claude Sonnet 4.6 |
 | **OpenRouter** | `-b or` | $0.44 | $0.87 | Anthropic-native | Multi-provider routing |
 | **Fireworks AI** | `-b fw` | $1.74 | $3.48 | Anthropic-native | Lowest latency (US) |
 | **Nvidia NIM** | `-b nv` | $0.44 | $0.87 | OpenAI-compat → proxy | kimi-k2.6 default |
@@ -82,30 +84,30 @@ deepclaude --benchmark          # Latency test
 
 ## Architecture
 
-deepclaude uses three different routing strategies depending on the backend type:
+deepclaude uses four routing strategies depending on the backend type:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    deepclaude launcher                       │
-│               (deepclaude.sh / deepclaude.ps1)              │
-├─────────────┬──────────────────┬────────────────────────────┤
-│  Native     │  OpenAI-compat   │  Kiro                      │
-│  Backends   │  Backends        │  Backend                   │
-├─────────────┼──────────────────┼────────────────────────────┤
-│ DeepSeek    │ Nvidia NIM       │ Kiro (AWS Claude)          │
-│ OpenRouter  │ Doubleword AI    │                            │
-│ Fireworks   │                  │                            │
-│ Kimi Code   │                  │                            │
-├─────────────┼──────────────────┼────────────────────────────┤
-│             │  Node.js Proxy   │  kirocc Gateway            │
-│  Direct     │  (model-proxy +  │  (Go binary, translates    │
-│  Connect    │  openai-translator)│ Anthropic ↔ AWS EventStream│
-│             │  Port: dynamic   │  Port: 3456)               │
-├─────────────┼──────────────────┼────────────────────────────┤
-│ Claude Code │ Claude Code      │ Claude Code                │
-│  ↓          │  ↓               │  ↓                         │
-│ Backend API │ localhost:PORT   │ localhost:3456              │
-└─────────────┴──────────────────┴────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          deepclaude launcher                              │
+│                   (deepclaude.sh / deepclaude.ps1)                       │
+├──────────────┬──────────────────┬───────────────────┬────────────────────┤
+│  Native      │  OpenAI-compat   │  Kiro             │  AWS Bedrock        │
+│  Backends    │  Backends        │  Backend          │  Backend            │
+├──────────────┼──────────────────┼───────────────────┼────────────────────┤
+│ DeepSeek     │ Nvidia NIM       │ Kiro (Pro/Free)   │ Bedrock (own AWS)   │
+│ OpenRouter   │ Doubleword AI    │                   │                     │
+│ Fireworks    │                  │                   │                     │
+│ Kimi Code    │                  │                   │                     │
+├──────────────┼──────────────────┼───────────────────┼────────────────────┤
+│              │  Node.js Proxy   │  kirocc Gateway   │  Node.js Proxy      │
+│  Direct      │  Anthropic ↔     │  Anthropic ↔      │  Anthropic ↔        │
+│  Connect     │  OpenAI format   │  AWS Event Stream │  AWS Event Stream   │
+│              │  Port: dynamic   │  Port: 3456       │  Port: dynamic      │
+├──────────────┼──────────────────┼───────────────────┼────────────────────┤
+│ Claude Code  │ Claude Code      │ Claude Code       │ Claude Code         │
+│  ↓           │  ↓               │  ↓                │  ↓                  │
+│ Backend API  │ localhost:PORT   │ localhost:3456    │ localhost:PORT      │
+└──────────────┴──────────────────┴───────────────────┴────────────────────┘
 ```
 
 ### Routing Strategy
@@ -113,8 +115,9 @@ deepclaude uses three different routing strategies depending on the backend type
 | Strategy | Backends | How it works |
 |---|---|---|
 | **Direct connect** | DeepSeek, OpenRouter, Fireworks, Kimi | Backend speaks Anthropic Messages API natively. `ANTHROPIC_BASE_URL` points directly to the backend. |
-| **Node.js proxy** | Nvidia, Doubleword | Backend speaks OpenAI Chat Completions API. A local Node.js proxy translates Anthropic ↔ OpenAI format in real-time. |
+| **Node.js proxy (OpenAI-compat)** | Nvidia, Doubleword | Backend speaks OpenAI Chat Completions API. A local Node.js proxy translates Anthropic ↔ OpenAI format in real-time. |
 | **kirocc gateway** | Kiro | Backend uses AWS Event Stream protocol. The `kirocc` Go binary translates Anthropic Messages API ↔ Kiro's internal AWS protocol. |
+| **Node.js proxy (Bedrock)** | AWS Bedrock | Same proxy handles Bedrock natively: builds `/model/{id}/invoke-with-response-stream` URLs, adds `anthropic_version: "bedrock-2023-05-31"`, decodes AWS Event Stream → SSE. |
 
 ---
 
@@ -211,6 +214,60 @@ Claude Code → kirocc (:3456) → AWS Event Stream → Kiro Backend → Claude 
 - **"kirocc not found"**: Install with `GOEXPERIMENT=jsonv2 go install github.com/d-kuro/kirocc/cmd/kirocc@latest`
 - **Auth errors**: Run `kiro-cli logout && kiro-cli login` to refresh credentials.
 - **Model names**: Always use **dot notation** (e.g., `claude-sonnet-4.6`) in `.env`, NOT dashes.
+
+---
+
+### AWS Bedrock
+
+**Type:** Bedrock (via Node.js proxy)
+**Cost:** Per-token via your AWS account (same as Anthropic direct: $3 / $15 per M for Sonnet 4)
+**Models:** Any Claude model on Bedrock — `global.anthropic.claude-sonnet-4-6`, `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, etc.
+
+Bedrock differs from Kiro in two important ways:
+- You use **your own AWS account** and get billed by AWS directly.
+- Authentication uses an **AWS Bedrock API key** (`ABSK…` prefix), not Kiro CLI credentials.
+
+#### Setup
+
+1. **Get an AWS Bedrock API key:**
+   - Open the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) → **API keys** → *Create API key*.
+   - Save the key (it starts with `ABSK…`). The key is **region-bound** — note which region you created it in.
+
+2. **Request model access** (one time):
+   - In the Bedrock console, go to **Model access** and request access to any Claude model you want to use (e.g., Claude Sonnet 4.6).
+
+3. **Configure `proxy/.env`:**
+   ```ini
+   AWS_API_KEY=ABSK…
+   AWS_REGION=us-east-1
+   AWS_MODEL=global.anthropic.claude-sonnet-4-6
+   ```
+
+4. **Run it:**
+   ```bash
+   deepclaude -b aws
+   ```
+
+#### Model ID format
+
+Newer Claude models on Bedrock require an **inference-profile prefix**, not a raw foundation model ID:
+
+| Prefix | Routes to |
+|---|---|
+| `us.anthropic.…` | US regions (us-east-1, us-west-2) |
+| `eu.anthropic.…` | EU regions |
+| `apac.anthropic.…` | Asia-Pacific regions |
+| `global.anthropic.…` | Cross-region (works from any region) |
+
+If you see `Invocation of model … with on-demand throughput isn't supported`, add one of these prefixes to `AWS_MODEL` and retry.
+
+#### What works through the Bedrock path
+
+The proxy converts Claude Code requests into Bedrock's expected shape:
+- Strips Claude Code-only fields (`context_management`, `mcp_servers`, `metadata`, `service_tier`, etc.) using a strict whitelist.
+- Adds `anthropic_version: "bedrock-2023-05-31"`.
+- Decodes the AWS Event Stream binary response back into Anthropic SSE.
+- Extended thinking, tool use, system prompts, and multimodal input all pass through.
 
 ---
 
@@ -328,6 +385,7 @@ Open a Claude Code session in any browser — with your chosen backend as the br
 ```bash
 deepclaude --remote                # Remote control + DeepSeek
 deepclaude --remote -b kiro        # Remote control + Kiro (AWS Claude)
+deepclaude --remote -b aws         # Remote control + AWS Bedrock
 deepclaude --remote -b or          # Remote control + OpenRouter
 deepclaude --remote -b anthropic   # Remote control + Anthropic (normal)
 ```
@@ -341,28 +399,6 @@ claude remote-control
 ```
 
 **Prerequisites:** Must be logged into Claude Code (`claude auth login`) and have a claude.ai subscription.
-
----
-
-## Live switching (no restart)
-
-Switch between backends **mid-session** from inside Claude Code. Add these files to `~/.claude/commands/`:
-
-**`deepseek.md`:**
-```
-Switch the model proxy to DeepSeek. Run this command silently and report the result:
-curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=deepseek"
-If successful, say: "Switched to DeepSeek."
-```
-
-**`anthropic.md`:**
-```
-Switch the model proxy back to Anthropic. Run this command silently and report the result:
-curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=anthropic"
-If successful, say: "Switched to Anthropic."
-```
-
-Then type `/deepseek` or `/anthropic` in any Claude Code session.
 
 ---
 
@@ -438,7 +474,10 @@ deepclaude-cli/
 | `KIMI_API_KEY` | For Kimi | API key from kimi.com |
 | `DOUBLEWORD_API_KEY` | For Doubleword | API key from doubleword.ai |
 | `KIRO_API_KEY` | For Kiro | API key (ksk_ prefix) from kiro.dev |
-| `API_PROVIDER` | No | Default backend (ds, or, fw, nv, kimi, dw, kiro) |
+| `AWS_API_KEY` | For AWS Bedrock | Bedrock API key (ABSK prefix) from AWS Console |
+| `AWS_REGION` | For AWS Bedrock | Region the key was issued in (e.g. `us-east-1`) |
+| `AWS_MODEL` | For AWS Bedrock | Bedrock model ID, e.g. `global.anthropic.claude-sonnet-4-6` |
+| `API_PROVIDER` | No | Default backend (ds, or, fw, nv, kimi, dw, kiro, aws) |
 
 ---
 

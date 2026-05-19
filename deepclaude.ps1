@@ -213,7 +213,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: deepclaude [-b backend] [--status] [--cost] [--benchmark]"
     Write-Host ""
-    Write-Host "  -b, --backend   ds (default), or, fw, nv, kimi, dw, kiro, anthropic"
+    Write-Host "  -b, --backend   ds (default), or, fw, nv, kimi, dw, kiro, aws, anthropic"
     Write-Host "  --status        Show keys and backends"
     Write-Host "  --cost          Pricing comparison"
     Write-Host "  --benchmark     Latency test"
@@ -321,7 +321,9 @@ function Start-KiroccGateway {
     # header so the Kiro backend routes it through API key validation, not OAuth.
     if ($KiroKey) {
         Write-Host "  Using KIRO_API_KEY for authentication (no OAuth required)" -ForegroundColor DarkGray
-        # kirocc reads KIRO_API_KEY from the environment automatically — nothing else needed.
+        # Ensure the key is in the Process environment so kirocc (child process) inherits it.
+        # $KiroKey may have been read from User scope, which child processes don't inherit.
+        [Environment]::SetEnvironmentVariable('KIRO_API_KEY', $KiroKey, 'Process')
     } else {
         # Fall back to kiro-cli SQLite OAuth tokens.
         $kiroDB = Join-Path $HOME ".local/share/kiro-cli/data.sqlite3"
@@ -380,8 +382,10 @@ except: print('false')
 
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
+    # Map Claude Code's date-suffixed model names to Kiro model IDs (same as deepclaude.sh).
+    [Environment]::SetEnvironmentVariable('KIROCC_MODEL_MAPPINGS', '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]', 'Process')
+
     # Kill any stale kirocc already listening on this port.
-    # Stop-Process -Force = SIGKILL equivalent — skips graceful shutdown which would hold
     # the port open until all active connections drain (potentially forever).
     $stalePid = (Get-NetTCPConnection -LocalPort $KiroccPort -State Listen -ErrorAction SilentlyContinue).OwningProcess
     if ($stalePid) {
@@ -393,9 +397,6 @@ except: print('false')
             $waitN++
         }
     }
-
-    # Map Claude Code's date-suffixed model names to Kiro model IDs.
-    $env:KIROCC_MODEL_MAPPINGS = '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]'
 
     # Capture kirocc output to temp files so we can show a useful error if startup fails.
     $kiroStdout = [System.IO.Path]::GetTempFileName()
