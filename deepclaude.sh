@@ -4,7 +4,16 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so SCRIPT_DIR points to the real repo, not /usr/local/bin
+# (deepclaude is typically symlinked into PATH).
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+    _SOURCE="$(readlink "$_SOURCE")"
+    [[ "$_SOURCE" != /* ]] && _SOURCE="$_DIR/$_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+unset _SOURCE _DIR
 
 # ── Load .env if present ──
 ENV_FILE="$SCRIPT_DIR/proxy/.env"
@@ -120,11 +129,18 @@ resolve_backend() {
             ;;
         kiro)
             # Kiro uses kirocc gateway — no API key needed (uses Kiro CLI auth)
-            # Model names must use dot notation without date suffixes
+            # Model names must use dot notation without date suffixes.
+            #
+            # KIRO_MODEL       — main model (Opus / Sonnet tiers)
+            # KIRO_HAIKU_MODEL — model for subagents / Haiku tier (cheaper)
+            #                    Defaults to claude-haiku-4.5 so subagents
+            #                    don't burn Opus credits when KIRO_MODEL is Opus.
             url="http://127.0.0.1:$KIROCC_PORT"
             key="dummy"  # kirocc ignores this unless -api-key is set
-            opus="${KIRO_MODEL:-claude-sonnet-4.6}"; sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
-            haiku="${KIRO_MODEL:-claude-haiku-4.5}"; subagent="${KIRO_MODEL:-claude-haiku-4.5}"
+            opus="${KIRO_MODEL:-claude-sonnet-4.6}"
+            sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
+            haiku="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
+            subagent="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
             ;;
         aws|bedrock)
             # AWS Bedrock with API key (ABSK prefix). Region from AWS_REGION (default us-east-1).
@@ -146,6 +162,7 @@ resolve_backend() {
 }
 
 set_model_env() {
+    export ANTHROPIC_MODEL="$RESOLVED_OPUS"
     export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
     export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
@@ -437,7 +454,8 @@ except: print('false')
           {"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},
           {"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},
           {"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},
-          {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}
+          {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000},
+          {"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000}
         ]'
 
         local kirocc_log
@@ -476,7 +494,7 @@ except: print('false')
         set_model_env
         unset ANTHROPIC_API_KEY
 
-        exec claude "$@"
+        exec claude --model "$RESOLVED_OPUS" "$@"
     fi
 
     # OpenAI-compat backends (nvidia, doubleword) MUST go through the proxy
@@ -537,7 +555,7 @@ except: print('false')
         set_model_env
         unset ANTHROPIC_API_KEY
 
-        exec claude "$@"
+        exec claude --model "$RESOLVED_OPUS" "$@"
     fi
 
     # Native Anthropic-format backends (deepseek, openrouter, fireworks, kimi)
@@ -546,7 +564,7 @@ except: print('false')
     set_model_env
     unset ANTHROPIC_API_KEY
 
-    exec claude "$@"
+    exec claude --model "$RESOLVED_OPUS" "$@"
 }
 
 launch_remote() {

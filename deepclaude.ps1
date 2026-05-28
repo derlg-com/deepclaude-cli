@@ -29,7 +29,25 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# ── Resolve symlinks so $ScriptDir points to the real repo, not (e.g.)
+#    "$env:USERPROFILE\.local\bin" or "/usr/local/bin" on PS Core / Linux.
+#    Without this, when deepclaude.ps1 is reached through a symlink in PATH,
+#    Split-Path returns the symlink's directory and proxy\.env never loads,
+#    so KIRO_MODEL / KIRO_API_KEY / API_PROVIDER all fall back to defaults.
+$_scriptPath = $MyInvocation.MyCommand.Path
+while ($_scriptPath) {
+    $_item = Get-Item -LiteralPath $_scriptPath -ErrorAction SilentlyContinue
+    if (-not $_item -or $_item.LinkType -ne 'SymbolicLink') { break }
+    $_target = $_item.Target
+    if ($_target -is [array]) { $_target = $_target[0] }   # PS 5.1 returns string[]
+    if (-not [System.IO.Path]::IsPathRooted($_target)) {
+        $_target = Join-Path (Split-Path -Parent $_scriptPath) $_target
+    }
+    $_scriptPath = $_target
+}
+$ScriptDir = Split-Path -Parent $_scriptPath
+Remove-Variable _scriptPath, _item, _target -ErrorAction SilentlyContinue
 
 # ── Load .env if present ──
 $envFile = Join-Path $ScriptDir "proxy\.env"
@@ -88,6 +106,10 @@ $KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
 $DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
 $DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
 $KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.6" }
+# Subagent / Haiku-tier model. Kept independent of $KiroModel so spawned
+# subagents stay cheap (Haiku) when the user runs Opus as their main model.
+# Override with KIRO_HAIKU_MODEL=claude-sonnet-4.6 for Sonnet subagents.
+$KiroHaikuModel = if ($env:KIRO_HAIKU_MODEL) { $env:KIRO_HAIKU_MODEL } else { "claude-haiku-4.5" }
 $AwsModel = if ($env:AWS_MODEL) { $env:AWS_MODEL } else { "global.anthropic.claude-sonnet-4-6" }
 $AwsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-east-1" }
 $KiroccPort = 3456
@@ -142,7 +164,7 @@ $Providers = @{
         url = "http://127.0.0.1:$KiroccPort"
         key = "dummy"; keyName = "KIRO_API_KEY"
         opus = $KiroModel; sonnet = $KiroModel
-        haiku = "claude-haiku-4.5"; subagent = "claude-haiku-4.5"
+        haiku = $KiroHaikuModel; subagent = $KiroHaikuModel
     }
     aws = @{
         name = "AWS Bedrock"; needsProxy = $true; canonical = "aws"
@@ -383,7 +405,7 @@ except: print('false')
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
     # Map Claude Code's date-suffixed model names to Kiro model IDs (same as deepclaude.sh).
-    [Environment]::SetEnvironmentVariable('KIROCC_MODEL_MAPPINGS', '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000}]', 'Process')
+    [Environment]::SetEnvironmentVariable('KIROCC_MODEL_MAPPINGS', '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000},{"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000}]', 'Process')
 
     # Kill any stale kirocc already listening on this port.
     # the port open until all active connections drain (potentially forever).
@@ -582,7 +604,7 @@ $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
 try {
-    & claude @Args
+    & claude --model $p.opus @Args
 } finally {
     if ($kiroccProc -and -not $kiroccProc.HasExited) {
         Stop-Process -Id $kiroccProc.Id -Force -ErrorAction SilentlyContinue

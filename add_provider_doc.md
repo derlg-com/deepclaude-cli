@@ -46,6 +46,10 @@ DOUBLEWORD_MODEL=deepseek-ai/DeepSeek-V4-Pro
 # Leave unset to use kiro-cli SQLite OAuth tokens instead.
 KIRO_API_KEY=ksk_your-kiro-key
 KIRO_MODEL=claude-sonnet-4.6
+# Optional: model used for subagents / Haiku tier. Defaults to claude-haiku-4.5
+# so spawned subagents stay cheap when KIRO_MODEL is set to Opus.
+# Set to claude-sonnet-4.6 if you want subagents on Sonnet instead.
+KIRO_HAIKU_MODEL=claude-haiku-4.5
 ```
 
 ### Step 2: Update the Bash Script
@@ -714,6 +718,196 @@ export KIROCC_MODEL_MAPPINGS='[
 ]'
 ```
 
+### Issue 7: `.env` Silently Not Loaded When Launcher Is Symlinked Into `PATH`
+
+**Symptom:** User installs the launcher with `sudo ln -s "$(pwd)/deepclaude.sh" /usr/local/bin/deepclaude` (the documented install step). When they run `deepclaude -b kiro`, the banner shows the **default fallback model** (e.g. `claude-sonnet-4.6 (main) + claude-haiku-4.5 (subagents)`) instead of the `KIRO_MODEL` they configured. `KIRO_API_KEY` also appears unset — no `Using KIRO_API_KEY for authentication` line is printed. The session still launches because `kirocc` falls back to SQLite OAuth tokens, which masks the bug.
+
+**Root cause:** Both launchers compute their own directory from the path used to invoke them, *without* resolving symlinks:
+
+```bash
+# deepclaude.sh — broken version
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/proxy/.env"
+```
+
+```powershell
+# deepclaude.ps1 — broken version
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$envFile = Join-Path $ScriptDir "proxy\.env"
+```
+
+When invoked via the symlink at `/usr/local/bin/deepclaude`, `${BASH_SOURCE[0]}` is `/usr/local/bin/deepclaude` — `dirname` gives `/usr/local/bin`, so `ENV_FILE` becomes `/usr/local/bin/proxy/.env`, which does not exist. `[[ -f "$ENV_FILE" ]]` silently returns false and the entire `.env` is skipped. Every variable falls back to its hardcoded default in `resolve_backend()`. Same problem on Windows when the script is reached via a Junction or symbolic link in `PATH`.
+
+**Wrong fix — `realpath "$0"` only:**
+```bash
+# WRONG: $0 may be the symlink name set by the calling shell, not necessarily
+# the actual script path. Also, realpath isn't guaranteed available on
+# minimal busybox / older macOS systems without coreutils.
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+```
+
+**Correct fix (bash):** walk the symlink chain manually so it works on macOS (no GNU `readlink -f`), Linux, and BSD:
+```bash
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+    _SOURCE="$(readlink "$_SOURCE")"
+    [[ "$_SOURCE" != /* ]] && _SOURCE="$_DIR/$_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+unset _SOURCE _DIR
+```
+
+**Correct fix (PowerShell):** `Get-Item` exposes `LinkType` and `Target` on `FileInfo`. Loop until we hit a non-symlink:
+```powershell
+$_scriptPath = $MyInvocation.MyCommand.Path
+while ($_scriptPath) {
+    $_item = Get-Item -LiteralPath $_scriptPath -ErrorAction SilentlyContinue
+    if (-not $_item -or $_item.LinkType -ne 'SymbolicLink') { break }
+    $_target = $_item.Target
+    if ($_target -is [array]) { $_target = $_target[0] }   # PS 5.1 returns string[]
+    if (-not [System.IO.Path]::IsPathRooted($_target)) {
+        $_target = Join-Path (Split-Path -Parent $_scriptPath) $_target
+    }
+    $_scriptPath = $_target
+}
+$ScriptDir = Split-Path -Parent $_scriptPath
+Remove-Variable _scriptPath, _item, _target -ErrorAction SilentlyContinue
+```
+
+**How to verify:**
+```bash
+# Bash: simulate invocation through the symlink without actually starting claude.
+# Drop a stub `claude` binary on PATH, then run the launcher via the symlink.
+PATH="/path/to/stub:$PATH" /usr/local/bin/deepclaude -b kiro 2>&1 | head -3
+# Expect:    Model: <KIRO_MODEL value>  (not the hardcoded default)
+```
+
+### Issue 8: Subagents Burn Opus Credits Because the Haiku Slot Inherits `KIRO_MODEL`
+
+**Symptom:** User sets `KIRO_MODEL=claude-opus-4.7` (Pro+ plan, 1M context). Every spawned subagent — small, parallel "Haiku-tier" tasks Claude Code dispatches via `CLAUDE_CODE_SUBAGENT_MODEL` — also runs on Opus 4.7. Credits drain ~10× faster than expected. The launcher banner reveals it:
+```
+Model: claude-opus-4.7 (main) + claude-opus-4.7 (subagents)   ← both slots are Opus
+```
+
+**Root cause:** The Kiro entry in `resolve_backend()` (and the equivalent `$Providers.kiro` hashtable in PowerShell) used `KIRO_MODEL` as the source for **all four** model slots:
+
+```bash
+# deepclaude.sh — broken version
+opus="${KIRO_MODEL:-claude-sonnet-4.6}";   sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
+haiku="${KIRO_MODEL:-claude-haiku-4.5}";   subagent="${KIRO_MODEL:-claude-haiku-4.5}"
+```
+
+The `:-claude-haiku-4.5` defaults are deceptive: they **only** apply when `KIRO_MODEL` is unset. As soon as the user sets `KIRO_MODEL=claude-opus-4.7`, the haiku and subagent slots resolve to `claude-opus-4.7` too. The `claude-haiku-4.5` literals are dead code in any normal deployment.
+
+This is a misuse of bash's `${VAR:-default}` syntax — it means *"value, or default if unset"*, **not** *"this slot's preferred default"*. To get independent slots, you need independent variables.
+
+**Correct fix (bash):** introduce a second env var, `KIRO_HAIKU_MODEL`, with its own default:
+```bash
+kiro)
+    # KIRO_MODEL       — main model (Opus / Sonnet tiers)
+    # KIRO_HAIKU_MODEL — model for subagents / Haiku tier (cheaper)
+    #                    Defaults to claude-haiku-4.5 so subagents
+    #                    don't burn Opus credits when KIRO_MODEL is Opus.
+    url="http://127.0.0.1:$KIROCC_PORT"
+    key="dummy"
+    opus="${KIRO_MODEL:-claude-sonnet-4.6}"
+    sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
+    haiku="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
+    subagent="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
+    ;;
+```
+
+**Correct fix (PowerShell):** read the variable once at the top of the script, then reference it in the provider table:
+```powershell
+$KiroModel       = if ($env:KIRO_MODEL)       { $env:KIRO_MODEL }       else { "claude-sonnet-4.6" }
+$KiroHaikuModel  = if ($env:KIRO_HAIKU_MODEL) { $env:KIRO_HAIKU_MODEL } else { "claude-haiku-4.5" }
+
+$Providers = @{
+    # ...
+    kiro = @{
+        name = "Kiro (AWS Claude)"; needsProxy = $false; needsKirocc = $true
+        url = "http://127.0.0.1:$KiroccPort"
+        key = "dummy"; keyName = "KIRO_API_KEY"
+        opus  = $KiroModel;       sonnet   = $KiroModel
+        haiku = $KiroHaikuModel;  subagent = $KiroHaikuModel
+    }
+}
+```
+
+**`.env` documentation (and Step 1 above should mirror this):**
+```ini
+KIRO_MODEL=claude-opus-4.7
+# Subagent / Haiku-tier model. Use a cheap model so spawned subagents don't burn
+# Opus credits. Set to claude-sonnet-4.6 if you want subagents on Sonnet instead.
+KIRO_HAIKU_MODEL=claude-haiku-4.5
+```
+
+**How to verify:**
+```bash
+# After fix, the launcher banner should show two different models:
+deepclaude -b kiro
+#   Model: claude-opus-4.7 (main) + claude-haiku-4.5 (subagents)
+```
+
+**Why two slots and not one:** Claude Code reads four env vars (`ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`) and routes work to them based on task complexity. Mapping `opus`/`sonnet` to one configurable model and `haiku`/`subagent` to another mirrors how Anthropic's Claude Code itself uses the tiers — main reasoning on the expensive model, mechanical fan-out work on the cheap one.
+
+### Issue 9: APAC / Cambodia Latency — Choosing the Right Region for Claude Backends
+
+**Symptom:** User in Phnom Penh, Cambodia (or anywhere in Southeast Asia) reports slow time-to-first-token on Claude. Default configs ship with `AWS_REGION=us-east-1` and Kiro's hardcoded `us-east-1` routing, both of which add ~290 ms of pure network RTT before the model even starts thinking.
+
+**Root cause — Kiro is unfixable:** Kiro proxies to AWS CodeWhisperer (`q.{region}.amazonaws.com`). I DNS-probed every APAC region and the `q.*` and `codewhisperer.*` hostnames only resolve in `us-east-1` and `eu-central-1`. There is no APAC endpoint to redirect to, so changing kirocc's hardcoded region (`internal/auth/apikey.go: region: "us-east-1"`) just produces NXDOMAIN. Subscription-Claude users are stuck at ~290 ms from SE Asia until AWS extends CodeWhisperer to APAC.
+
+**Root cause — AWS Bedrock IS fixable but the key is region-bound:** `ABSK…` Bedrock API keys are issued per-region. A key created in `us-east-1` returns `AccessDeniedException` if used against `bedrock-runtime.ap-southeast-1.amazonaws.com`. The `global.anthropic.…` inference profile prefix does *not* save you — it only routes inference cross-region after the request is already inside AWS; the network ingress still happens at the region in `AWS_REGION`. So just changing `AWS_REGION` without re-issuing the key silently fails.
+
+**Measured latency from Phnom Penh, Cambodia (8-sample TCP-connect medians):**
+
+| Backend / Region | Median | Min–Max | Notes |
+|---|---|---|---|
+| Bedrock `ap-southeast-1` (Singapore) | **69 ms** | 60–76 | ⭐ best for SE Asia |
+| Bedrock `ap-southeast-5` (Malaysia)  | 72 ms | 62–148 | close, more jitter |
+| Bedrock `ap-southeast-7` (Bangkok)   | 94 ms | 86–97 | stable second-tier |
+| Bedrock `ap-northeast-1` (Tokyo)     | 132 ms | 129–181 | stable |
+| Bedrock `ap-south-2` (Hyderabad)     | 118 ms | 106–363 | high jitter |
+| Bedrock `ap-southeast-3` (Jakarta)   | 172 ms | 90–300 | high jitter |
+| Bedrock `ap-south-1` (Mumbai)        | 280 ms | 141–381 | high jitter |
+| Bedrock `us-east-1` (Virginia)       | 288 ms | 286–459 | reference |
+| **Kiro (locked, `us-east-1`)**       | **289 ms** | 275–308 | unfixable |
+
+**Why Singapore beats Bangkok despite being further:** Cambodia's submarine cable transit (AAE-1, MCT) lands in Singapore. Most ISP backbones in Phnom Penh peer with Singapore-IX before reaching Bangkok. The ~25 ms Singapore→Bangkok hop is added on top, not subtracted.
+
+**Correct fix — for AWS Bedrock users in APAC:**
+
+1. **Issue a Singapore-region API key** (existing key won't work):
+   - AWS Console → Bedrock → region selector top-right → *Asia Pacific (Singapore) ap-southeast-1*
+   - API keys → *Create API key* → save the new `ABSK…` value
+2. **Request model access in `ap-southeast-1`** (one-time, ~instant for Claude):
+   - Same console region → Model access → enable Anthropic Claude Sonnet 4.6
+3. **Update `proxy/.env`**:
+   ```ini
+   AWS_API_KEY=ABSK…NEW_KEY_FROM_SINGAPORE_CONSOLE…
+   AWS_REGION=ap-southeast-1
+   AWS_MODEL=apac.anthropic.claude-sonnet-4-6   # APAC inference profile
+   ```
+4. Run `deepclaude -b aws` and verify the banner shows
+   `Endpoint: https://bedrock-runtime.ap-southeast-1.amazonaws.com`.
+
+**No fix available for Kiro from APAC:** Document the limitation in `.env` so users don't waste time looking. The only mitigation is HTTP/2 keep-alive (already on by default in `kirocc`'s Go HTTP client), which amortizes the 289 ms handshake across all requests in a session.
+
+**How to verify your own region's latency** (run on the user's machine, not from a US datacenter):
+```bash
+for r in ap-southeast-1 ap-southeast-7 ap-northeast-1 us-east-1; do
+    samples=()
+    for i in 1 2 3 4 5 6 7 8; do
+        t=$(curl -s -o /dev/null -w "%{time_connect}" --connect-timeout 4 \
+            "https://bedrock-runtime.$r.amazonaws.com/" 2>/dev/null)
+        samples+=("$(awk "BEGIN{printf \"%d\", $t * 1000}")")
+    done
+    median=$(printf '%s\n' "${samples[@]}" | sort -n | sed -n '5p')
+    printf "%-20s : %sms (median of 8)\n" "$r" "$median"
+done
+```
+
 ---
 
 ## 5. Summary of Core Provider Types Implemented
@@ -727,5 +921,7 @@ export KIROCC_MODEL_MAPPINGS='[
     - **Process lifecycle management** (`ss`-first stale detection, `kill -9` to bypass Go's graceful shutdown, poll-until-free wait loop instead of fixed sleep)
     - **Health check robustness** (`--max-time 1` on curl, progress dots, kirocc log captured to temp file and shown on failure)
     - **`lsof` hang avoidance** (replaced `lsof` with `ss` as primary PID detector — `lsof` blocks indefinitely on NFS/zombie-process systems)
+    - **Symlink-aware launcher** (resolve `${BASH_SOURCE[0]}` / `$MyInvocation.MyCommand.Path` chain so `proxy/.env` loads when `deepclaude` is on `PATH` via a symlink — Issue 7)
+    - **Independent main / subagent model slots** via `KIRO_MODEL` + `KIRO_HAIKU_MODEL` so subagents don't inherit Opus credits when the user runs Opus as their main model — Issue 8)
 
 By following this guide, you can confidently integrate any future LLM provider, regardless of whether it uses native Anthropic, OpenAI format, or a proprietary enterprise gateway.
