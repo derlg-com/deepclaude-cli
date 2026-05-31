@@ -169,6 +169,24 @@ resolve_backend() {
     RESOLVED_HAIKU="$haiku"; RESOLVED_SUBAGENT="$subagent"
 }
 
+# Infer a model's real context window (tokens). Tries, in order:
+#   1. explicit CONTEXT_WINDOW_TOKENS env (user override, always wins)
+#   2. a lookup by model-name substring (case-insensitive)
+#   3. empty (caller keeps Claude Code's 200k default)
+detect_context_window() {
+    local model="${1,,}"
+    if [[ -n "${CONTEXT_WINDOW_TOKENS:-}" ]]; then
+        echo "$CONTEXT_WINDOW_TOKENS"; return
+    fi
+    case "$model" in
+        *deepseek-v4*|*deepseek-v3.2*)        echo 1000000 ;;
+        *nemotron*)                            echo 1000000 ;;  # nemotron-3-super 1M
+        *kimi-k2*|*kimi-for-coding*|*moonshot*|*kimi*) echo 262144 ;;  # 256k
+        *deepseek*)                            echo 131072 ;;   # older deepseek 128k
+        *)                                     echo "" ;;
+    esac
+}
+
 set_model_env() {
     export ANTHROPIC_MODEL="$RESOLVED_OPUS"
     export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
@@ -176,6 +194,22 @@ set_model_env() {
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
     export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
+
+    # Context-window unlock for non-Claude backends. Claude Code defaults every
+    # non-Claude model ID to 200k. Kiro uses the [1m] model-name trick (handled
+    # in resolve_backend, preserves auto-compaction). All other backends forward
+    # the model name verbatim upstream, so the only safe lever is an explicit
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS, which Claude Code honours only when
+    # DISABLE_COMPACT is truthy. Auto-detected from the model name; override
+    # with CONTEXT_WINDOW_TOKENS in .env.
+    if ! needs_kirocc; then
+        local cw
+        cw=$(detect_context_window "$RESOLVED_OPUS")
+        if [[ -n "$cw" ]]; then
+            export DISABLE_COMPACT=1
+            export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$cw"
+        fi
+    fi
 }
 
 show_status() {
@@ -361,6 +395,7 @@ launch_claude() {
         unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
         unset ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL
         unset CLAUDE_CODE_EFFORT_LEVEL
+        unset DISABLE_COMPACT CLAUDE_CODE_MAX_CONTEXT_TOKENS
         exec claude "$@"
     fi
 

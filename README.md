@@ -147,7 +147,7 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 
 **Type:** kirocc gateway (Go binary)  
 **Cost:** Subscription-based ($0 Free / $20 Pro / $40 Pro+)  
-**Models:** `claude-sonnet-4.6` (Pro), `claude-sonnet-4.5` (Free), `claude-haiku-4.5`, `claude-opus-4.6`
+**Models:** `claude-sonnet-4.6` (Pro), `claude-sonnet-4.5` (Free), `claude-haiku-4.5`, `claude-opus-4.6`, `claude-opus-4.7`, `claude-opus-4.8`
 
 Kiro provides access to Claude models through Amazon's AWS infrastructure using a subscription model instead of per-token billing.
 
@@ -206,7 +206,7 @@ Claude Code → kirocc (:3456) → AWS Event Stream → Kiro Backend → Claude 
 | Free ($0) | Sonnet 4.5, Haiku 4.5 | 50 |
 | Pro ($20) | + Sonnet 4.6, Opus 4.6 | 1,000 |
 | Pro+ ($40) | + Sonnet 4.6, Opus 4.6 | 2,000 |
-| Power ($200) | + Sonnet 4.6, Opus 4.6, Opus 4.7 | 10,000 |
+| Power ($200) | + Sonnet 4.6, Opus 4.6, Opus 4.7, Opus 4.8 | 10,000 |
 
 #### Troubleshooting Kiro
 
@@ -478,6 +478,27 @@ deepclaude-cli/
 | `AWS_REGION` | For AWS Bedrock | Region the key was issued in (e.g. `us-east-1`) |
 | `AWS_MODEL` | For AWS Bedrock | Bedrock model ID, e.g. `global.anthropic.claude-sonnet-4-6` |
 | `API_PROVIDER` | No | Default backend (ds, or, fw, nv, kimi, dw, kiro, aws) |
+| `CONTEXT_WINDOW_TOKENS` | No | Override the context window (tokens) for non-Kiro backends, e.g. `1000000`. See [Context window](#context-window). |
+
+---
+
+## Context window
+
+Claude Code only knows the context-window size of Anthropic's own models — it defaults **every other model to 200K tokens**, even when the backend model supports far more. deepclaude unlocks the real window automatically:
+
+| Backend | How the window is set |
+|---|---|
+| **Kiro** | The launcher appends a `[1m]` suffix to 1M-capable Opus models (`claude-opus-4.6/4.7/4.8`). kirocc strips `[1m]` upstream and maps to the real SKU. Auto-compaction stays on. |
+| **DeepSeek / OpenRouter / Fireworks / Nvidia / Kimi / Doubleword** | The launcher auto-detects the window from the model name (e.g. DeepSeek V4 → 1M, Kimi → 256K, Nemotron → 1M) and sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. |
+| **AWS Bedrock** | Opt-in: set `CONTEXT_WINDOW_TOKENS=1000000` and the proxy adds the `context-1m-2025-08-07` beta to the request body for 1M-capable Claude models. |
+
+**Manual override:** set `CONTEXT_WINDOW_TOKENS` in `proxy/.env` to your model's real window. This always wins over auto-detection:
+
+```ini
+CONTEXT_WINDOW_TOKENS=1000000
+```
+
+**Tradeoff:** for non-Kiro backends, unlocking a larger window requires `DISABLE_COMPACT=1` (Claude Code's own requirement), so auto-compaction is turned off. Use `/compact` manually for very long sessions. Set the value to the model's *actual* window — going higher than the backend supports causes upstream errors.
 
 ---
 

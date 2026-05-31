@@ -117,6 +117,31 @@ $AwsModel = if ($env:AWS_MODEL) { $env:AWS_MODEL } else { "global.anthropic.clau
 $AwsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-east-1" }
 $KiroccPort = 3456
 
+# Context-window unlock for non-Claude backends. Claude Code defaults every
+# non-Claude model ID to 200k. Kiro uses the [1m] model-name trick instead.
+# Other backends forward the model name upstream, so the only safe lever is an
+# explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS, honoured only when DISABLE_COMPACT
+# is truthy. Auto-detected from the model name; override with
+# CONTEXT_WINDOW_TOKENS in .env.
+function Get-ContextWindow {
+    param([string]$Model)
+    if ($env:CONTEXT_WINDOW_TOKENS) { return $env:CONTEXT_WINDOW_TOKENS }
+    $m = $Model.ToLower()
+    if ($m -match 'deepseek-v4|deepseek-v3\.2|nemotron') { return "1000000" }
+    if ($m -match 'kimi|moonshot')                       { return "262144" }
+    if ($m -match 'deepseek')                            { return "131072" }
+    return $null
+}
+function Set-ContextWindow {
+    param([string]$Model, [switch]$SkipForKiro)
+    if ($SkipForKiro) { return }
+    $cw = Get-ContextWindow $Model
+    if ($cw) {
+        $env:DISABLE_COMPACT = "1"
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = $cw
+    }
+}
+
 $Providers = @{
     ds = @{
         name = "DeepSeek (direct)"; needsProxy = $false
@@ -470,7 +495,8 @@ if ($Remote) {
         Write-Host "`n  Launching remote control (Anthropic)...`n" -ForegroundColor Cyan
         foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
+            "CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL",
+            "DISABLE_COMPACT","CLAUDE_CODE_MAX_CONTEXT_TOKENS")) {
             Remove-Item "Env:$v" -ErrorAction SilentlyContinue
         }
         Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
@@ -537,6 +563,7 @@ if ($Remote) {
     $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = $p.haiku
     $env:CLAUDE_CODE_SUBAGENT_MODEL = $p.subagent
     $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
+    Set-ContextWindow -Model $p.opus -SkipForKiro:([bool]$p.needsKirocc)
     Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
 
@@ -604,6 +631,7 @@ $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $p.sonnet
 $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = $p.haiku
 $env:CLAUDE_CODE_SUBAGENT_MODEL = $p.subagent
 $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
+Set-ContextWindow -Model $p.opus -SkipForKiro:([bool]$p.needsKirocc)
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
 try {

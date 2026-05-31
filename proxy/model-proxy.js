@@ -568,6 +568,13 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     for (const k of BEDROCK_ALLOWED) {
                         if (parsedAnthropicBody[k] !== undefined) bedrockBody[k] = parsedAnthropicBody[k];
                     }
+                    // 1M context: Bedrock takes the beta in the body (header is stripped),
+                    // and only when explicitly wanted. Opt in via CONTEXT_WINDOW_TOKENS>=1000000.
+                    // Scoped to Claude Code's 1M-capable set (opus-4-6/7/8, sonnet-4-0/5/6).
+                    const wants1M = parseInt(process.env.CONTEXT_WINDOW_TOKENS || '0', 10) >= 1000000;
+                    if (wants1M && /claude-(opus-4-[678]|sonnet-4-[056])/.test(modelId.toLowerCase())) {
+                        bedrockBody.anthropic_beta = ['context-1m-2025-08-07'];
+                    }
                     body = Buffer.from(JSON.stringify(bedrockBody));
                     console.error(`[MODEL-PROXY] #${reqId} → bedrock ${modelId} (${Object.keys(bedrockBody).length} fields)`);
                 } else if (isModelCall && parsedAnthropicBody) {
