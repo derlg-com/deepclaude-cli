@@ -138,7 +138,15 @@ resolve_backend() {
             url="http://127.0.0.1:$KIROCC_PORT"
             key="dummy"  # kirocc ignores this unless -api-key is set
             opus="${KIRO_MODEL:-claude-sonnet-4.6}"
-            sonnet="${KIRO_MODEL:-claude-sonnet-4.6}"
+            # Claude Code selects the 1M context window only when the launched
+            # model id carries a [1m] suffix. Append it for 1M-capable models
+            # (must match the 1000000 entries in KIROCC_MODEL_MAPPINGS below);
+            # kirocc strips [1m] and maps to the real Kiro SKU upstream.
+            case "$opus" in
+                *'[1m]') ;;
+                claude-opus-4.6|claude-opus-4.7|claude-opus-4.8) opus="${opus}[1m]" ;;
+            esac
+            sonnet="$opus"
             haiku="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
             subagent="${KIRO_HAIKU_MODEL:-claude-haiku-4.5}"
             ;;
@@ -455,7 +463,9 @@ except: print('false')
           {"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},
           {"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},
           {"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000},
-          {"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000}
+          {"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000},
+          {"anthropic":"claude-opus-4-8-20250514","kiro":"claude-opus-4.8","context_window_size":1000000},
+          {"anthropic":"claude-opus-4-8","kiro":"claude-opus-4.8","context_window_size":1000000}
         ]'
 
         local kirocc_log

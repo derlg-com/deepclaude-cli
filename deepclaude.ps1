@@ -106,6 +106,9 @@ $KimiModel = if ($env:KIMI_MODEL) { $env:KIMI_MODEL } else { "kimi-for-coding" }
 $DoublewordModel = if ($env:DOUBLEWORD_MODEL) { $env:DOUBLEWORD_MODEL } else { "deepseek-ai/DeepSeek-V4-Pro" }
 $DeepSeekModel = if ($env:DEEPSEEK_MODEL) { $env:DEEPSEEK_MODEL } else { "deepseek-v4-pro" }
 $KiroModel = if ($env:KIRO_MODEL) { $env:KIRO_MODEL } else { "claude-sonnet-4.6" }
+# Claude Code picks the 1M context window only when the launched model id ends
+# with [1m]. Append it for 1M-capable Opus models; kirocc strips [1m] upstream.
+$KiroMain = if ($KiroModel -match '\[1m\]$') { $KiroModel } elseif ($KiroModel -in @("claude-opus-4.6","claude-opus-4.7","claude-opus-4.8")) { "$KiroModel[1m]" } else { $KiroModel }
 # Subagent / Haiku-tier model. Kept independent of $KiroModel so spawned
 # subagents stay cheap (Haiku) when the user runs Opus as their main model.
 # Override with KIRO_HAIKU_MODEL=claude-sonnet-4.6 for Sonnet subagents.
@@ -163,7 +166,7 @@ $Providers = @{
         name = "Kiro (AWS Claude)"; needsProxy = $false; needsKirocc = $true
         url = "http://127.0.0.1:$KiroccPort"
         key = "dummy"; keyName = "KIRO_API_KEY"
-        opus = $KiroModel; sonnet = $KiroModel
+        opus = $KiroMain; sonnet = $KiroMain
         haiku = $KiroHaikuModel; subagent = $KiroHaikuModel
     }
     aws = @{
@@ -405,7 +408,7 @@ except: print('false')
     Write-Host "  Starting kirocc gateway on :$KiroccPort..." -ForegroundColor DarkGray
 
     # Map Claude Code's date-suffixed model names to Kiro model IDs (same as deepclaude.sh).
-    [Environment]::SetEnvironmentVariable('KIROCC_MODEL_MAPPINGS', '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000},{"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000}]', 'Process')
+    [Environment]::SetEnvironmentVariable('KIROCC_MODEL_MAPPINGS', '[{"anthropic":"claude-sonnet-4-6-20250514","kiro":"claude-sonnet-4.6","context_window_size":200000},{"anthropic":"claude-sonnet-4-5-20250929","kiro":"claude-sonnet-4.5","context_window_size":200000},{"anthropic":"claude-haiku-4-5-20250929","kiro":"claude-haiku-4.5","context_window_size":200000},{"anthropic":"claude-opus-4-6-20250514","kiro":"claude-opus-4.6","context_window_size":1000000},{"anthropic":"claude-opus-4-7-20250514","kiro":"claude-opus-4.7","context_window_size":1000000},{"anthropic":"claude-opus-4-7","kiro":"claude-opus-4.7","context_window_size":1000000},{"anthropic":"claude-opus-4-8-20250514","kiro":"claude-opus-4.8","context_window_size":1000000},{"anthropic":"claude-opus-4-8","kiro":"claude-opus-4.8","context_window_size":1000000}]', 'Process')
 
     # Kill any stale kirocc already listening on this port.
     # the port open until all active connections drain (potentially forever).
