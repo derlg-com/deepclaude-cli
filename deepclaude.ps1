@@ -57,7 +57,7 @@ if (Test-Path $envFile) {
         if ($line -match '^\s*#' -or [string]::IsNullOrWhiteSpace($line)) { return }
         # Strip inline comments
         $line = $line -replace '\s+#.*$', ''
-        if ($line -match '^([A-Z_]+)=(.*)$') {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
             $key = $Matches[1]
             $val = $Matches[2]
             # Only set if not already in environment
@@ -240,7 +240,7 @@ function Select-Backend {
 }
 
 if (-not $BackendExplicit -and -not $Status -and -not $Cost -and -not $Benchmark -and -not $Help `
-    -and -not [Console]::IsInputRedirected) {
+    -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
     Select-Backend
 }
 
@@ -413,7 +413,7 @@ function Start-KiroccGateway {
     } else {
         # Fall back to kiro-cli SQLite OAuth tokens.
         $kiroDB = Join-Path $HOME ".local/share/kiro-cli/data.sqlite3"
-        if ($IsWindows) { $kiroDB = Join-Path $env:LOCALAPPDATA "kiro-cli/data.sqlite3" }
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') { $kiroDB = Join-Path $env:LOCALAPPDATA "kiro-cli/data.sqlite3" }
         $hasTokens = $false
         if (Test-Path $kiroDB) {
             try {
@@ -645,11 +645,11 @@ if ($Backend -eq "all" -or $Backend -eq "gateway") {
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 200
         $c = (Get-Content $tempFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if ($c -match '^\d+$') { $proxyPort = $c; break }
+        if ($c -and ($c.Trim() -match '^\d+$')) { $proxyPort = $c.Trim(); break }
     }
     Remove-Item $tempFile -ErrorAction SilentlyContinue
     if (-not $proxyPort) { Write-Host "ERROR: gateway proxy failed to start" -ForegroundColor Red; exit 1 }
-    $models = (Invoke-RestMethod -Uri "http://127.0.0.1:$proxyPort/v1/models" -TimeoutSec 3).data
+    $models = @((Invoke-RestMethod -Uri "http://127.0.0.1:$proxyPort/v1/models" -TimeoutSec 3).data)
     if (-not $models -or $models.Count -eq 0) {
         Write-Host "ERROR: gateway has no models - set at least one provider API key in proxy\.env" -ForegroundColor Red; exit 1
     }
