@@ -93,6 +93,63 @@ const BEDROCK_BACKENDS = new Set(['aws']);
  */
 const STRIP_ANTHROPIC_HEADERS = new Set(['kimi', 'nvidia', 'doubleword', 'aws']);
 
+// ── Unified gateway model registry ──────────────────────────────
+// In gateway mode the proxy advertises every configured provider's
+// models through GET /v1/models so Claude Code's /model picker (with
+// CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) lists them all.
+// Claude Code only keeps model ids matching /^(claude|anthropic)/i, so
+// ids are prefixed `claude-gw-<prov>-<model>`; the human label (with the
+// provider name) goes in display_name. A trailing [1m] makes Claude Code
+// size the context window to 1M for capable models.
+const PROVIDER_LABELS = {
+    deepseek: 'DeepSeek', openrouter: 'OpenRouter', fireworks: 'Fireworks',
+    nvidia: 'Nvidia', kimi: 'Kimi', doubleword: 'Doubleword',
+};
+const ENV_MODELS_KEY = {
+    nvidia: 'NVIDIA_MODELS', deepseek: 'DEEPSEEK_MODELS', doubleword: 'DOUBLEWORD_MODELS',
+    openrouter: 'OPENROUTER_MODELS', fireworks: 'FIREWORKS_MODELS', kimi: 'KIMI_MODELS',
+};
+// Curated defaults shown when <PROV>_MODELS isn't set. Kiro/AWS are Claude
+// backends launched on their own (-b kiro/-b aws) and aren't aggregated here.
+const GATEWAY_MODEL_LISTS = {
+    nvidia: ['nvidia/nemotron-3-super-120b-a12b', 'moonshotai/kimi-k2.6', 'deepseek-ai/deepseek-v4-pro', 'qwen/qwen3-coder-480b-a35b-instruct', 'openai/gpt-oss-120b'],
+    deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash'],
+    doubleword: ['deepseek-ai/DeepSeek-V4-Pro'],
+    openrouter: ['deepseek/deepseek-v4-pro'],
+    fireworks: ['accounts/fireworks/models/deepseek-v4-pro'],
+    kimi: ['kimi-for-coding'],
+};
+
+function isOneMModel(model) {
+    return /deepseek-v4|deepseek-v3\.2|nemotron/i.test(model);
+}
+
+// Build the registry from the configured backends. Returns an array of
+// { id, idBase, backend, upstreamModel, display }.
+function buildGatewayRegistry(allBackends) {
+    const entries = [];
+    for (const prov of Object.keys(GATEWAY_MODEL_LISTS)) {
+        if (!allBackends[prov] || !allBackends[prov].apiKey) continue;
+        const envList = (process.env[ENV_MODELS_KEY[prov]] || '').split(',').map(s => s.trim()).filter(Boolean);
+        const models = envList.length ? envList : GATEWAY_MODEL_LISTS[prov];
+        for (const model of models) {
+            const idBase = 'claude-gw-' + (prov + '-' + model).replace(/[^a-zA-Z0-9]+/g, '-').replace(/-+$/, '');
+            const id = idBase + (isOneMModel(model) ? '[1m]' : '');
+            entries.push({ id, idBase, backend: prov, upstreamModel: model, display: `${PROVIDER_LABELS[prov] || prov}: ${model}` });
+        }
+    }
+    return entries;
+}
+
+// Resolve a model id from Claude Code back to its registry entry. Tolerates
+// the optional trailing [1m] suffix.
+function lookupGatewayModel(registry, model) {
+    if (!model) return null;
+    const base = String(model).replace(/\[1m\]$/, '');
+    return registry.find(e => e.id === model || e.idBase === base) || null;
+}
+
+
 /**
  * Transform stream that intercepts SSE events and injects missing `usage`
  * fields. DeepSeek/OpenRouter may omit `usage` in message_start or
@@ -301,6 +358,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
         const initialName = defaultMode || (backends ? 'anthropic' : null);
         const startBackend = initialName && initialName !== 'anthropic' && allBackends[initialName];
 
+        // Gateway (multi-provider) mode: aggregate every backend's models
+        // into one /model picker and route each request by its model id.
+        const gatewayMode = initialName === 'gateway';
+        const gatewayRegistry = gatewayMode ? buildGatewayRegistry(allBackends) : [];
+        if (gatewayMode) {
+            console.error(`[MODEL-PROXY] gateway mode: ${gatewayRegistry.length} models from ${[...new Set(gatewayRegistry.map(e => e.backend))].join(', ')}`);
+        }
+
         const state = {
             mode: initialName || '_single',
             target: startBackend ? startBackend.target : initialTarget,
@@ -431,12 +496,35 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 return;
             }
 
+            // Gateway model discovery: Claude Code (with
+            // CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) fetches this to
+            // populate its /model picker with every provider's models.
+            if (gatewayMode && urlPath === '/v1/models' && clientReq.method === 'GET') {
+                clientRes.writeHead(200, { 'content-type': 'application/json' });
+                clientRes.end(JSON.stringify({
+                    data: gatewayRegistry.map(e => ({
+                        type: 'model',
+                        id: e.id,
+                        display_name: e.display,
+                        created_at: '2025-01-01T00:00:00Z',
+                    })),
+                }));
+                return;
+            }
+
             // In anthropic mode, everything passes through transparently
             const isAnthropicMode = state.mode === 'anthropic';
             const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
-            const isOpenAICompat = isModelCall && OPENAI_COMPAT_BACKENDS.has(state.mode);
-            const isBedrock = isModelCall && BEDROCK_BACKENDS.has(state.mode);
-            const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
+
+            // Per-request route. Defaults to the session backend (state); in
+            // gateway mode it's overridden from the model id after the body is
+            // parsed (see clientReq.on('end')). Request-local so concurrent
+            // requests to different providers never clobber each other.
+            let rtMode = state.mode, rtTarget = state.target, rtKey = state.apiKey, rtUseBearer = state.useBearer;
+
+            let isOpenAICompat = isModelCall && OPENAI_COMPAT_BACKENDS.has(rtMode);
+            let isBedrock = isModelCall && BEDROCK_BACKENDS.has(rtMode);
+            let dest = isModelCall ? rtTarget : new URL(ANTHROPIC_FALLBACK);
 
             // Build upstream path
             let fullPath;
@@ -448,7 +536,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     // Path built later (need the model ID from the parsed body); placeholder for now.
                     fullPath = '/__bedrock_pending__';
                 } else {
-                    const base = state.target.pathname.replace(/\/$/, '');
+                    const base = rtTarget.pathname.replace(/\/$/, '');
                     let overlap = '';
                     for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
                         if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
@@ -463,10 +551,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const t0 = Date.now();
 
             if (isModelCall) {
-                console.error(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath} (${state.mode}${isOpenAICompat ? ', OpenAI-compat' : ''})`);
+                console.error(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath} (${rtMode}${isOpenAICompat ? ', OpenAI-compat' : ''})`);
             }
 
-            const headers = { ...clientReq.headers, host: dest.host };
+            let headers = { ...clientReq.headers, host: dest.host };
             delete headers['content-length'];
 
             if (isModelCall) {
@@ -474,15 +562,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 delete headers['x-api-key'];
                 if (isBedrock) {
                     // Bedrock uses Bearer auth with the API key (ABSK...).
-                    headers['authorization'] = `Bearer ${state.apiKey}`;
-                } else if (state.useBearer) {
-                    headers['authorization'] = `Bearer ${state.apiKey}`;
+                    headers['authorization'] = `Bearer ${rtKey}`;
+                } else if (rtUseBearer) {
+                    headers['authorization'] = `Bearer ${rtKey}`;
                 } else {
-                    headers['x-api-key'] = state.apiKey;
+                    headers['x-api-key'] = rtKey;
                 }
 
                 // Strip Anthropic-specific headers that some backends reject
-                if (STRIP_ANTHROPIC_HEADERS.has(state.mode)) {
+                if (STRIP_ANTHROPIC_HEADERS.has(rtMode)) {
                     delete headers['anthropic-beta'];
                 }
 
@@ -516,6 +604,46 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     try {
                         parsedAnthropicBody = JSON.parse(body);
                     } catch { /* pass through */ }
+                }
+
+                // Gateway routing: choose the backend from the selected model
+                // id (falls back to the first registry model for bootstrap /
+                // unmatched calls), then recompute the route for that backend.
+                if (gatewayMode && isModelCall && parsedAnthropicBody) {
+                    const entry = lookupGatewayModel(gatewayRegistry, parsedAnthropicBody.model) || gatewayRegistry[0];
+                    if (entry) {
+                        const b = allBackends[entry.backend];
+                        rtMode = entry.backend; rtTarget = b.target; rtKey = b.apiKey; rtUseBearer = b.useBearer;
+                        parsedAnthropicBody.model = entry.upstreamModel;
+                        targetModel = entry.upstreamModel;
+                        isOpenAICompat = OPENAI_COMPAT_BACKENDS.has(rtMode);
+                        isBedrock = BEDROCK_BACKENDS.has(rtMode);
+                        dest = rtTarget;
+                        if (isOpenAICompat) {
+                            fullPath = '/v1/chat/completions';
+                        } else {
+                            const base = rtTarget.pathname.replace(/\/$/, '');
+                            let overlap = '';
+                            for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
+                                if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                            }
+                            fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
+                        }
+                        headers = { ...clientReq.headers, host: dest.host };
+                        delete headers['content-length'];
+                        delete headers['authorization'];
+                        delete headers['x-api-key'];
+                        if (rtUseBearer) headers['authorization'] = `Bearer ${rtKey}`;
+                        else headers['x-api-key'] = rtKey;
+                        if (STRIP_ANTHROPIC_HEADERS.has(rtMode)) delete headers['anthropic-beta'];
+                        if (isOpenAICompat) {
+                            delete headers['anthropic-version'];
+                            delete headers['anthropic-beta'];
+                            headers['content-type'] = 'application/json';
+                            headers['accept'] = 'text/event-stream';
+                        }
+                        console.error(`[MODEL-PROXY] #${reqId} gateway route → ${rtMode}:${entry.upstreamModel} (${dest.hostname})`);
+                    }
                 }
 
                 if (isModelCall && parsedAnthropicBody && MODEL_REMAP[state.mode]) {
@@ -608,7 +736,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                                 type: 'error',
                                 error: {
                                     type: 'api_error',
-                                    message: `Upstream ${state.mode} returned ${proxyRes.statusCode}: ${errBody.substring(0, 200)}`,
+                                    message: `Upstream ${rtMode} returned ${proxyRes.statusCode}: ${errBody.substring(0, 200)}`,
                                 },
                             };
                             clientRes.writeHead(proxyRes.statusCode, { 'content-type': 'application/json' });
@@ -629,7 +757,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             'connection': 'keep-alive',
                         });
                         const decoder = new BedrockEventStreamToSSE(
-                            (inp, out) => recordUsage(state.mode, inp, out)
+                            (inp, out) => recordUsage(rtMode, inp, out)
                         );
                         proxyRes.pipe(decoder).pipe(clientRes);
                         proxyRes.on('end', () => {
@@ -644,7 +772,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         clientRes.writeHead(proxyRes.statusCode, anthropicHeaders);
                         const translator = new OpenAIToAnthropicStream(
                             targetModel || parsedAnthropicBody?.model,
-                            (inp, out) => recordUsage(state.mode, inp, out)
+                            (inp, out) => recordUsage(rtMode, inp, out)
                         );
                         proxyRes.pipe(translator).pipe(clientRes);
                         proxyRes.on('end', () => {
@@ -662,7 +790,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             try {
                                 const openaiResp = JSON.parse(raw);
                                 const anthropicResp = openAIToAnthropic(openaiResp, targetModel || parsedAnthropicBody?.model);
-                                recordUsage(state.mode, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+                                recordUsage(rtMode, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
                                 const fixed = Buffer.from(JSON.stringify(anthropicResp));
                                 const outHeaders = fixResponseHeaders(proxyRes.headers, false);
                                 outHeaders['content-length'] = fixed.length;
@@ -681,7 +809,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     // ── Native Anthropic SSE (DeepSeek, Kimi, OpenRouter) ──
                     if (isModelCall && isSSE) {
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
+                        const norm = new UsageNormalizer((inp, out) => recordUsage(rtMode, inp, out));
                         proxyRes.pipe(norm).pipe(clientRes);
                         proxyRes.on('end', () => {
                             console.error(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
@@ -694,7 +822,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             const fixed = normalizeJsonBody(raw);
                             try {
                                 const j = JSON.parse(fixed);
-                                if (j.usage) recordUsage(state.mode, j.usage.input_tokens, j.usage.output_tokens);
+                                if (j.usage) recordUsage(rtMode, j.usage.input_tokens, j.usage.output_tokens);
                             } catch {}
                             const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
                             clientRes.writeHead(proxyRes.statusCode, outHeaders);

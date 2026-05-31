@@ -55,7 +55,7 @@ if (targetUrl && apiKey) {
         backends: hasBackends ? backends : undefined,
         defaultMode,
     });
-    console.log(port);
+    console.log(String(port));
 } else {
     const fallbackUrl = backends.deepseek?.url || 'https://api.deepseek.com/anthropic';
     const fallbackKey = backends.deepseek?.apiKey || 'unused';

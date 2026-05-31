@@ -49,6 +49,7 @@ AWS_URL="https://bedrock-runtime.${AWS_REGION_DEFAULT}.amazonaws.com"
 # Read default from .env API_PROVIDER or fallback to ds
 DEFAULT_BACKEND="${API_PROVIDER:-ds}"
 BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-$DEFAULT_BACKEND}"
+BACKEND_EXPLICIT=0
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
@@ -56,7 +57,7 @@ PROXY_PID=""
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --backend|-b) BACKEND="$2"; shift 2 ;;
+        --backend|-b) BACKEND="$2"; BACKEND_EXPLICIT=1; shift 2 ;;
         --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
         --remote|-r)  ACTION="remote"; shift ;;
         --status)     ACTION="status"; shift ;;
@@ -202,7 +203,7 @@ set_model_env() {
     # CLAUDE_CODE_MAX_CONTEXT_TOKENS, which Claude Code honours only when
     # DISABLE_COMPACT is truthy. Auto-detected from the model name; override
     # with CONTEXT_WINDOW_TOKENS in .env.
-    if ! needs_kirocc; then
+    if ! needs_kirocc && [[ "$BACKEND" != "all" && "$BACKEND" != "gateway" ]]; then
         local cw
         cw=$(detect_context_window "$RESOLVED_OPUS")
         if [[ -n "$cw" ]]; then
@@ -397,6 +398,58 @@ launch_claude() {
         unset CLAUDE_CODE_EFFORT_LEVEL
         unset DISABLE_COMPACT CLAUDE_CODE_MAX_CONTEXT_TOKENS
         exec claude "$@"
+    fi
+
+    # Unified gateway: aggregate every configured provider's models into
+    # Claude Code's /model picker (gateway discovery) and route each request
+    # to the right provider by its model id. Switch live with /model.
+    if [[ "$BACKEND" == "all" || "$BACKEND" == "gateway" ]]; then
+        echo "  Starting unified gateway (all providers)..."
+        local port_file
+        port_file=$(mktemp)
+        node "$SCRIPT_DIR/proxy/start-proxy.js" https://api.anthropic.com dummy --mode gateway > "$port_file" 2>/dev/null &
+        PROXY_PID=$!
+        local tries=0
+        while [[ ! -s "$port_file" ]] && [[ $tries -lt 30 ]]; do sleep 0.2; tries=$((tries + 1)); done
+        local proxy_port
+        proxy_port=$(grep -oE '^[0-9]+$' "$port_file" | head -1)
+        rm -f "$port_file"
+        if [[ -z "$proxy_port" ]]; then echo "ERROR: gateway proxy failed to start" >&2; exit 1; fi
+
+        local models_json def_model count
+        models_json=$(curl -s --max-time 3 "http://127.0.0.1:$proxy_port/v1/models")
+        def_model=$(echo "$models_json" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
+        count=$(echo "$models_json" | grep -oE '"id":"' | wc -l | tr -d ' ')
+        if [[ -z "$def_model" ]]; then
+            echo "ERROR: gateway has no models — set at least one provider API key in proxy/.env" >&2
+            exit 1
+        fi
+        echo "  Gateway on :$proxy_port — $count models aggregated."
+        echo "  In Claude Code, run /model to pick a provider/model."
+        echo ""
+
+        export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
+        export ANTHROPIC_AUTH_TOKEN="gateway-managed"
+        export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+        # Pre-write Claude Code's gateway-models cache so /model is populated
+        # immediately — its own startup fetch is timing/gate-dependent and may
+        # not have run yet. fE4() requires baseUrl to equal ANTHROPIC_BASE_URL.
+        node -e '
+const fs=require("fs"),os=require("os"),path=require("path");
+const data=JSON.parse(process.argv[1]).data||[];
+const dir=process.env.CLAUDE_CONFIG_DIR||path.join(os.homedir(),".claude");
+fs.mkdirSync(path.join(dir,"cache"),{recursive:true});
+fs.writeFileSync(path.join(dir,"cache","gateway-models.json"),JSON.stringify({
+  baseUrl:process.argv[2],fetchedAt:Date.now(),
+  models:data.map(m=>({id:m.id,display_name:m.display_name||m.id})),
+}));' "$models_json" "$ANTHROPIC_BASE_URL" 2>/dev/null || true
+
+        RESOLVED_OPUS="$def_model"; RESOLVED_SONNET="$def_model"
+        RESOLVED_HAIKU="$def_model"; RESOLVED_SUBAGENT="$def_model"
+        set_model_env
+        unset ANTHROPIC_API_KEY
+        exec claude --model "$def_model" "$@"
     fi
 
     resolve_backend
@@ -691,6 +744,48 @@ launch_remote() {
 
     claude remote-control "$@"
 }
+
+# --- Interactive provider/model picker ---
+# Lists configured providers (key present, or always-available kiro/anthropic)
+# with their model, and lets the user choose. Shown on bare interactive runs.
+pick_backend() {
+    local codes=() names=() models=() ckey
+    _row() { # code name model keyval
+        codes+=("$1"); names+=("$2"); models+=("$3")
+    }
+    _row all "All providers" "→ pick any model in Claude Code via /model"
+    [[ -n "${DEEPSEEK_API_KEY:-}"   ]] && _row ds   "DeepSeek"          "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
+    [[ -n "${OPENROUTER_API_KEY:-}" ]] && _row or   "OpenRouter"        "deepseek/deepseek-v4-pro"
+    [[ -n "${FIREWORKS_API_KEY:-}"  ]] && _row fw   "Fireworks"         "accounts/fireworks/models/deepseek-v4-pro"
+    [[ -n "${NVIDIA_API_KEY:-}"     ]] && _row nv   "Nvidia NIM"        "${NVIDIA_MODEL:-moonshotai/kimi-k2.6}"
+    [[ -n "${KIMI_API_KEY:-}"       ]] && _row kimi "Kimi Code"         "${KIMI_MODEL:-kimi-for-coding}"
+    [[ -n "${DOUBLEWORD_API_KEY:-}" ]] && _row dw   "Doubleword"        "${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
+    _row kiro "Kiro (AWS Claude)" "${KIRO_MODEL:-claude-sonnet-4.6}"
+    [[ -n "${AWS_API_KEY:-}"        ]] && _row aws  "AWS Bedrock"       "${AWS_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+    _row anthropic "Anthropic" "(Claude default)"
+
+    echo "" >&2
+    echo "  deepclaude — select provider / model:" >&2
+    local i
+    for i in "${!codes[@]}"; do
+        local def=""
+        [[ "${codes[$i]}" == "$BACKEND" ]] && def="  ← default"
+        printf "    %2d) %-18s %-44s%s\n" "$((i+1))" "${names[$i]}" "${models[$i]}" "$def" >&2
+    done
+    printf "  Choice [Enter = %s]: " "$BACKEND" >&2
+    local choice; read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#codes[@]} )); then
+        BACKEND="${codes[$((choice-1))]}"
+    fi
+    echo "  → using: $BACKEND" >&2
+    echo "" >&2
+}
+
+# Show the picker on interactive launch/remote runs when no -b was given.
+if [[ "$ACTION" == "launch" || "$ACTION" == "remote" ]] \
+   && [[ $BACKEND_EXPLICIT -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+    pick_backend
+fi
 
 # --- Main ---
 case "$ACTION" in

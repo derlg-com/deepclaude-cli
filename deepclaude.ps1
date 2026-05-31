@@ -73,6 +73,9 @@ if (-not $Backend -and -not $Status -and -not $Cost -and -not $Benchmark -and -n
     $Backend = if ($env:CHEAPCLAUDE_DEFAULT_BACKEND) { $env:CHEAPCLAUDE_DEFAULT_BACKEND }
                elseif ($envProvider) { $envProvider }
                else { "ds" }
+    $BackendExplicit = $false
+} else {
+    $BackendExplicit = [bool]$Backend
 }
 
 # --- Config ---
@@ -206,6 +209,39 @@ $Providers = @{
 function Get-KeyDisplay($k) {
     if (-not $k) { return "MISSING" }
     return "set (****" + $k.Substring($k.Length - [Math]::Min(4, $k.Length)) + ")"
+}
+
+# --- Interactive provider/model picker ---
+# Lists configured providers (key present, or always-available kiro/anthropic)
+# with their model, and lets the user choose. Shown on bare interactive runs.
+function Select-Backend {
+    $order = @('ds','or','fw','nv','kimi','dw','kiro','aws')
+    $menu = @()
+    $menu += [pscustomobject]@{ code = 'all'; name = 'All providers'; model = 'pick any model in Claude Code via /model' }
+    foreach ($code in $order) {
+        $pp = $Providers[$code]
+        $hasKey = $pp.key -and $pp.key -ne 'dummy'
+        if ($code -eq 'kiro' -or $hasKey) {
+            $menu += [pscustomobject]@{ code = $code; name = $pp.name; model = ($pp.opus -replace '\[1m\]$','') }
+        }
+    }
+    $menu += [pscustomobject]@{ code = 'anthropic'; name = 'Anthropic'; model = '(Claude default)' }
+
+    Write-Host "`n  deepclaude - select provider / model:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $menu.Count; $i++) {
+        $def = if ($menu[$i].code -eq $Backend) { "  <- default" } else { "" }
+        Write-Host ("    {0,2}) {1,-18} {2,-44}{3}" -f ($i + 1), $menu[$i].name, $menu[$i].model, $def)
+    }
+    $choice = Read-Host "  Choice [Enter = $Backend]"
+    if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $menu.Count) {
+        $script:Backend = $menu[[int]$choice - 1].code
+    }
+    Write-Host "  -> using: $Backend`n" -ForegroundColor Green
+}
+
+if (-not $BackendExplicit -and -not $Status -and -not $Cost -and -not $Benchmark -and -not $Help `
+    -and -not [Console]::IsInputRedirected) {
+    Select-Backend
 }
 
 # --- Status ---
@@ -587,6 +623,63 @@ if ($Backend -eq "anthropic") {
     }
     Write-Host "`n  Launching Claude Code (normal Anthropic)...`n" -ForegroundColor Cyan
     & claude @Args
+    exit 0
+}
+
+# Unified gateway: aggregate every configured provider's models into Claude
+# Code's /model picker (gateway discovery) and route each request by model id.
+if ($Backend -eq "all" -or $Backend -eq "gateway") {
+    Write-Host "`n  Starting unified gateway (all providers)..." -ForegroundColor Cyan
+    foreach ($pair in @(
+        @{ k = 'DEEPSEEK_API_KEY'; v = $DeepSeekKey }, @{ k = 'OPENROUTER_API_KEY'; v = $OpenRouterKey },
+        @{ k = 'FIREWORKS_API_KEY'; v = $FireworksKey }, @{ k = 'NVIDIA_API_KEY'; v = $NvidiaKey },
+        @{ k = 'KIMI_API_KEY'; v = $KimiKey }, @{ k = 'DOUBLEWORD_API_KEY'; v = $DoublewordKey }
+    )) { if ($pair.v) { [Environment]::SetEnvironmentVariable($pair.k, $pair.v, 'Process') } }
+
+    $proxyScript = Join-Path $ScriptDir "proxy\start-proxy.js"
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    $proxyProc = Start-Process -FilePath "node" `
+        -ArgumentList @($proxyScript, "https://api.anthropic.com", "dummy", "--mode", "gateway") `
+        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tempFile
+    $proxyPort = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 200
+        $c = (Get-Content $tempFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($c -match '^\d+$') { $proxyPort = $c; break }
+    }
+    Remove-Item $tempFile -ErrorAction SilentlyContinue
+    if (-not $proxyPort) { Write-Host "ERROR: gateway proxy failed to start" -ForegroundColor Red; exit 1 }
+    $models = (Invoke-RestMethod -Uri "http://127.0.0.1:$proxyPort/v1/models" -TimeoutSec 3).data
+    if (-not $models -or $models.Count -eq 0) {
+        Write-Host "ERROR: gateway has no models - set at least one provider API key in proxy\.env" -ForegroundColor Red; exit 1
+    }
+    $defModel = $models[0].id
+    Write-Host "  Gateway on :$proxyPort - $($models.Count) models aggregated." -ForegroundColor Green
+    Write-Host "  In Claude Code, run /model to pick a provider/model.`n" -ForegroundColor DarkGray
+    $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$proxyPort"
+    $env:ANTHROPIC_AUTH_TOKEN = "gateway-managed"
+    $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
+
+    # Pre-write Claude Code's gateway-models cache so /model is populated
+    # immediately (its own startup fetch is timing/gate-dependent).
+    $cfgDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
+    New-Item -ItemType Directory -Force -Path (Join-Path $cfgDir "cache") | Out-Null
+    $epochMs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    $cacheObj = [ordered]@{
+        baseUrl   = "http://127.0.0.1:$proxyPort"
+        fetchedAt = $epochMs
+        models    = @($models | ForEach-Object { [ordered]@{ id = $_.id; display_name = $_.display_name } })
+    }
+    $cacheObj | ConvertTo-Json -Depth 5 -Compress | Set-Content -Path (Join-Path $cfgDir "cache\gateway-models.json") -Encoding UTF8
+
+    $env:ANTHROPIC_DEFAULT_OPUS_MODEL = $defModel
+    $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $defModel
+    $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = $defModel
+    $env:CLAUDE_CODE_SUBAGENT_MODEL = $defModel
+    $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
+    Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+    try { & claude --model $defModel @Args }
+    finally { if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue } }
     exit 0
 }
 

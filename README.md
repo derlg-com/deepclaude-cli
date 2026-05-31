@@ -48,9 +48,26 @@ Copy-Item deepclaude.ps1 "$env:USERPROFILE\.local\bin\deepclaude.ps1"
 
 ### 4. Use it
 
+Run `deepclaude` with no flags and it shows an **interactive picker** of your
+configured providers and their models — just type a number to launch:
+
+```text
+  deepclaude — select provider / model:
+     1) DeepSeek           deepseek-v4-pro
+     2) Nvidia NIM         nvidia/nemotron-3-super-120b-a12b
+     3) Kiro (AWS Claude)  claude-opus-4.8              ← default
+     4) Anthropic          (Claude default)
+  Choice [Enter = kiro]:
+```
+
+The menu lists only providers whose API key is set (Kiro and Anthropic always
+appear). Pass `-b` to skip the picker, and it's auto-skipped in
+non-interactive/CI runs (falls back to `API_PROVIDER`).
+
 ```bash
-deepclaude                      # Launch with default backend (from API_PROVIDER in .env)
-deepclaude -b kiro              # Use Kiro (AWS Claude, subscription)
+deepclaude                      # Interactive provider/model picker (bare run)
+deepclaude -b all               # Unified gateway — ALL providers in Claude Code's /model
+deepclaude -b kiro              # Use Kiro (AWS Claude, subscription) — skips picker
 deepclaude -b aws               # Use AWS Bedrock (your own AWS account)
 deepclaude -b nv                # Use Nvidia NIM
 deepclaude -b kimi              # Use Kimi Code
@@ -63,6 +80,37 @@ deepclaude --status             # Show all backends and key status
 deepclaude --cost               # Pricing comparison
 deepclaude --benchmark          # Latency test
 ```
+
+### Unified model picker (`-b all`)
+
+`deepclaude -b all` starts a **gateway** that aggregates every configured
+provider's models into Claude Code's own `/model` picker. Launch once, then
+switch models/providers live from inside Claude Code:
+
+```text
+> /model
+   Nvidia: nvidia/nemotron-3-super-120b-a12b
+   Nvidia: moonshotai/kimi-k2.6
+   DeepSeek: deepseek-v4-pro
+   Doubleword: deepseek-ai/DeepSeek-V4-Pro
+   Kimi: kimi-for-coding
+   …
+```
+
+Each pick routes that request to the right provider. Curate the list per
+provider with `<PROV>_MODELS` in `proxy/.env` (e.g.
+`NVIDIA_MODELS=nvidia/nemotron-3-super-120b-a12b,moonshotai/kimi-k2.6`).
+
+Notes:
+- Requires Claude Code's gateway discovery (the launcher sets
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` automatically).
+- Claude Code only lists model ids beginning with `claude`, so gateway ids are
+  internally prefixed `claude-gw-<provider>-<model>`; the human label (with the
+  provider name) is shown via `display_name`.
+- **Subagents** use the Haiku tier, which defaults to the gateway's default
+  model — your `/model` pick drives the main session, not spawned subagents.
+- Kiro and AWS Bedrock are Claude-native backends; launch those with
+  `-b kiro` / `-b aws`.
 
 ---
 
